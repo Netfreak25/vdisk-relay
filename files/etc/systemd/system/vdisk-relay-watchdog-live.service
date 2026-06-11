@@ -1,0 +1,14 @@
+[Unit]
+Description=vdisk-relay live watchdog checks outside send path
+After=local-fs.target
+ConditionPathExists=/usr/local/sbin/vdisk-relay
+ConditionPathExists=/usbdisk.img
+ConditionPathExists=/etc/vdisk-relay.live-enabled
+ConditionPathExists=/etc/vdisk-relay.allow-sync
+
+[Service]
+Type=oneshot
+ExecStart=/bin/bash -lc '/usr/local/sbin/vdisk-relay gadget-watchdog || true; /usr/local/sbin/vdisk-relay image-watchdog || true'
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7

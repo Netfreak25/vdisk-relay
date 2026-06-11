@@ -1,0 +1,54 @@
+#!/usr/bin/env python3
+import json
+import os
+import sys
+
+CREDENTIALS_FILE = "/var/lib/vdisk-relay/git-credentials.json"
+
+
+def main():
+    prompt = " ".join(sys.argv[1:]).lower()
+    try:
+        with open(CREDENTIALS_FILE, "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+    except Exception:
+        return 1
+
+    username = str(data.get("username", ""))
+    token = str(data.get("token", ""))
+    if not username or not token:
+        return 1
+
+    username_keywords = (
+        "username",
+        "benutzer",
+        "user",
+        "anmeldename",
+        "anmelde",
+        "login",
+        "ident",
+        "credential",
+    )
+    password_keywords = (
+        "password",
+        "passwort",
+        "passcode",
+        "pass phrase",
+        "secret",
+        "token",
+        "passphrase",
+        "pass",
+    )
+
+    if any(mark in prompt for mark in password_keywords):
+        print(token)
+        return 0
+    if any(mark in prompt for mark in username_keywords) or prompt.startswith("for 'https://") or "https://" in prompt:
+        print(username)
+        return 0
+
+    return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

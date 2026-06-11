@@ -1,0 +1,16 @@
+*.bak*
+*.pass
+vdisk-relay.env
+.git-credentials
+git-credentials.json
+/run/
+var/lib/
+var/log/
+*.tmp
+vdisk-relay-rsync.pass
+__pycache__/
+*.pyc
+AGENTS.md
+docs/internal/
+*.internal.md
+*.private.md

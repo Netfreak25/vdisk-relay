@@ -1,0 +1,14 @@
+[Unit]
+Description=vdisk-relay live trigger pending
+ConditionPathExists=/usr/local/sbin/vdisk-relay
+ConditionPathExists=/usbdisk.img
+ConditionPathExists=/etc/vdisk-relay.live-enabled
+ConditionPathExists=/etc/vdisk-relay.allow-trigger
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/vdisk-relay trigger --source=inotify-path
+ExecStartPost=/usr/local/sbin/vdisk-relay post-trigger
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7

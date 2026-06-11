@@ -1,0 +1,13 @@
+[Unit]
+Description=vdisk-relay live health watchdog timer
+ConditionPathExists=/etc/vdisk-relay.live-enabled
+ConditionPathExists=/etc/vdisk-relay.allow-health-reboot
+
+[Timer]
+OnBootSec=15min
+OnUnitActiveSec=4h
+AccuracySec=5min
+Unit=vdisk-relay-health-live.service
+
+[Install]
+WantedBy=timers.target

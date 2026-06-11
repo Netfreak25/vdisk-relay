@@ -1,0 +1,11 @@
+[Unit]
+Description=vdisk-relay debug status cache timer
+
+[Timer]
+OnBootSec=90s
+OnUnitActiveSec=10min
+AccuracySec=1min
+Unit=vdisk-relay-debug-cache.service
+
+[Install]
+WantedBy=timers.target

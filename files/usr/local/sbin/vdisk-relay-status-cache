@@ -1,0 +1,1303 @@
+#!/usr/bin/env python3
+import json
+import os
+import re
+import html
+import shlex
+import socket
+import subprocess
+import sys
+import time
+from datetime import datetime, timezone
+from urllib.parse import urlencode
+from urllib.request import Request, urlopen
+
+RUN_DIR = "/run/vdisk-relay"
+STATE_DIR = "/var/lib/vdisk-relay"
+TEXT_OUT = f"{RUN_DIR}/status-login.txt"
+JSON_OUT = f"{RUN_DIR}/status.json"
+ATTEMPT_OUT = f"{RUN_DIR}/status-last-attempt.json"
+LOG_FILE = "/var/log/vdisk-relay.log"
+IMAGE_FILE = "/usbdisk.img"
+MOUNTPOINT = "/run/vdisk-relay/mnt"
+PREVIEW_DIR = "/var/cache/vdisk-relay-previews"
+PREVIEW_INDEX = f"{PREVIEW_DIR}/index.json"
+PREVIEW_BACKLOG = f"{PREVIEW_DIR}/backlog.json"
+ENV_FILE = "/etc/vdisk-relay.env"
+CONFIG_FILE = "/etc/vdisk-relay.conf"
+MAINT_NOTIFY_ALLOW = "/etc/vdisk-relay.allow-maintenance-notify"
+MAINT_NOTIFY_CONFIG = "/etc/vdisk-relay-maintenance-notify.json"
+MAINT_NOTIFY_STATE = f"{STATE_DIR}/maintenance-notify-state.json"
+MAINT_NOTIFY_DEFAULT_INTERVAL_SECONDS = 30 * 60
+TELEGRAM_SEND_TIMEOUT_SECONDS = 12
+
+MAINTENANCE_FACTORS = [
+    ("usb_gadget_module", "USB-Gadget Module"),
+    ("usb_gadget_basis", "USB-Gadget Base"),
+    ("backing_image", "Backing-Image"),
+    ("image_file", "Image File"),
+    ("mtime_fallback", "mtime-Fallback"),
+    ("pending_state", "Pending-State"),
+    ("retry_timer", "Retry-Timer"),
+    ("fast_path", "Fast Path"),
+    ("telegram_queue", "Telegram-Queue"),
+    ("watchdog_timer", "Watchdog-Timer"),
+    ("inotify_path", "inotify-Path"),
+    ("video_freshness", "Data-Freshness"),
+    ("local_mount", "Local Mount"),
+    ("loopdevice", "Loopdevice"),
+]
+
+UNITS = [
+    "vdisk-relay-gadget-live.service",
+    "vdisk-relay-watch-live.path",
+    "vdisk-relay-trigger-live.service",
+    "vdisk-relay-fast-sync.service",
+    "vdisk-relay-ultra-fast-sync.service",
+    "vdisk-relay-sync-live.service",
+    "vdisk-relay-telegram-queue.service",
+    "vdisk-relay-telegram-queue.timer",
+    "vdisk-relay-retry-live.service",
+    "vdisk-relay-retry-live.timer",
+    "vdisk-relay-image-mtime-watch.service",
+    "vdisk-relay-image-mtime-watch.timer",
+    "vdisk-relay-watchdog-live.service",
+    "vdisk-relay-watchdog-live.timer",
+    "vdisk-relay-archive-live.service",
+    "vdisk-relay-archive-live.timer",
+    "vdisk-relay-health-live.service",
+    "vdisk-relay-health-live.timer",
+    "vdisk-relay-boot-notify-live.service",
+    "vdisk-relay-network-guardian.service",
+    "vdisk-relay-network-guardian.timer",
+    "vdisk-relay-web.service",
+    "vdisk-relay-web-status-cache.service",
+    "vdisk-relay-web-status-cache.timer",
+    "vdisk-relay-status-cache.service",
+    "vdisk-relay-status-cache.timer",
+    "vdisk-relay-preview-cache.service",
+    "vdisk-relay-preview-cache.timer",
+    "vdisk-relay-update.service",
+    "vdisk-relay-update-check.service",
+    "vdisk-relay-update-check.timer",
+    "vdisk-relay-debug-cache.service",
+    "vdisk-relay-debug-cache.timer",
+    "vdisk-relay-format-on-boot.service",
+]
+
+
+def run(cmd, timeout=6):
+    try:
+        p = subprocess.run(
+            ["/usr/bin/timeout", f"{timeout}s", "/bin/bash", "-lc", cmd],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=timeout + 2,
+            check=False,
+        )
+        return {
+            "cmd": cmd,
+            "rc": p.returncode,
+            "out": p.stdout.strip(),
+        }
+    except subprocess.TimeoutExpired:
+        return {
+            "cmd": cmd,
+            "rc": 124,
+            "out": f"TIMEOUT after {timeout}s",
+        }
+    except Exception as e:
+        return {
+            "cmd": cmd,
+            "rc": 1,
+            "out": f"ERROR: {e}",
+        }
+
+
+def status_component_id(name):
+    value = (name or "").strip().lower()
+    value = value.replace("/", "_")
+    value = re.sub(r"[^a-z0-9]+", "_", value)
+    return value.strip("_") or "unknown"
+
+
+STATUS_STATES = ("OK", "PENDING", "WARN", "FAIL", "DISABLED", "UNKNOWN")
+STATUS_PREFIXES = {
+    "OK": "OK    ",
+    "PENDING": "PEND  ",
+    "WARN": "WARN  ",
+    "FAIL": "FAIL  ",
+    "DISABLED": "OFF   ",
+    "UNKNOWN": "UNKN  ",
+}
+STATUS_PREFIX_TO_STATE = {
+    "OK": "OK",
+    "PEND": "PENDING",
+    "WARN": "WARN",
+    "WATCH": "WARN",
+    "FAIL": "FAIL",
+    "CRITICAL": "FAIL",
+    "OFF": "DISABLED",
+    "DISABLED": "DISABLED",
+    "UNKN": "UNKNOWN",
+    "UNKNOWN": "UNKNOWN",
+}
+
+
+def normalize_status_state(state):
+    raw = str(state or "").strip().upper()
+    return STATUS_PREFIX_TO_STATE.get(raw, raw if raw in STATUS_STATES else "UNKNOWN")
+
+
+def status_exitcode_for_state(state):
+    return 0 if normalize_status_state(state) == "OK" else 2
+
+
+def overall_state_from_components(components):
+    states = [
+        normalize_status_state(component.get("state"))
+        for component in components
+        if str(component.get("id") or "") != "overall"
+    ]
+    if any(state == "FAIL" for state in states):
+        return "FAIL"
+    if any(state in ("PENDING", "WARN", "UNKNOWN") for state in states):
+        return "WARN"
+    return "OK"
+
+
+def parse_systemctl_show(unit):
+    props = [
+        "Id",
+        "ActiveState",
+        "SubState",
+        "Result",
+        "ExecMainStatus",
+        "ActiveEnterTimestamp",
+        "InactiveEnterTimestamp",
+        "ExecMainStartTimestamp",
+        "ExecMainExitTimestamp",
+        "UnitFileState",
+        "NRestarts",
+    ]
+
+    cmd = "systemctl show " + unit + " " + " ".join("-p " + p for p in props) + " --no-pager 2>/dev/null"
+    res = run(cmd, 4)
+    data = {"unit": unit, "available": False}
+
+    if res["rc"] not in (0,):
+        data["error"] = res["out"]
+        return data
+
+    for line in res["out"].splitlines():
+        if "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        if value:
+            data[key] = value
+
+    data["available"] = bool(data.get("Id"))
+    return data
+
+
+def file_info(path):
+    try:
+        st = os.stat(path)
+        return {
+            "exists": True,
+            "size": st.st_size,
+            "mtime_epoch": int(st.st_mtime),
+            "mtime": datetime.fromtimestamp(st.st_mtime).astimezone().isoformat(),
+            "age_seconds": int(time.time() - st.st_mtime),
+        }
+    except FileNotFoundError:
+        return {"exists": False}
+
+
+def grep_last(lines, pattern):
+    rx = re.compile(pattern)
+    for line in reversed(lines):
+        if rx.search(line):
+            return line
+    return ""
+
+
+def tail_file(path, n=120):
+    if not os.path.exists(path):
+        return []
+    res = run(f"tail -n {int(n)} {path} 2>/dev/null || true", 5)
+    return res["out"].splitlines() if res["out"] else []
+
+
+def write_atomic(path, content, mode=0o644):
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(content)
+    os.chmod(tmp, mode)
+    os.replace(tmp, path)
+
+
+def load_json(path, default=None):
+    if default is None:
+        default = {}
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as handle:
+            data = json.load(handle)
+        return data
+    except Exception:
+        return default
+
+
+def write_json_atomic(path, data, mode=0o644):
+    os.makedirs(os.path.dirname(path), mode=0o755, exist_ok=True)
+    write_atomic(path, json.dumps(data, ensure_ascii=False, indent=2, sort_keys=True) + "\n", mode)
+
+
+def log_line(level, message):
+    try:
+        os.makedirs(os.path.dirname(LOG_FILE), mode=0o755, exist_ok=True)
+        stamp = datetime.now().astimezone().strftime("%F %T%z")
+        with open(LOG_FILE, "a", encoding="utf-8", errors="replace") as handle:
+            handle.write(f"{stamp} [{level}] status-cache: {message}\n")
+    except Exception:
+        pass
+
+
+def parse_shell_assignment(line):
+    stripped = line.strip()
+    if not stripped or stripped.startswith("#") or "=" not in stripped:
+        return None
+    key, _value = stripped.split("=", 1)
+    key = key.strip()
+    if not re.match(r"^[A-Z0-9_]+$", key):
+        return None
+    try:
+        parts = shlex.split(stripped, comments=False, posix=True)
+    except Exception:
+        parts = [stripped]
+    if not parts or "=" not in parts[0]:
+        return None
+    parsed_key, parsed_value = parts[0].split("=", 1)
+    if parsed_key != key:
+        return None
+    return key, parsed_value
+
+
+def parse_env_file():
+    return parse_shell_file(ENV_FILE)
+
+
+def parse_config_file():
+    return parse_shell_file(CONFIG_FILE)
+
+
+def source_section(lines):
+    start = None
+    end = None
+    for i, line in enumerate(lines):
+        if line.strip() == "SOURCES=(":
+            start = i
+            continue
+        if start is not None and line.strip() == ")":
+            end = i
+            break
+    if start is None or end is None:
+        return None, None
+    return start, end
+
+
+def parse_sources():
+    try:
+        with open(CONFIG_FILE, "r", encoding="utf-8", errors="replace") as handle:
+            lines = handle.read().splitlines()
+    except Exception:
+        return []
+
+    start, end = source_section(lines)
+    if start is None or end is None:
+        return []
+
+    sources = []
+    for line in lines[start + 1:end]:
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        try:
+            values = shlex.split(stripped, comments=True, posix=True)
+        except ValueError:
+            continue
+        if not values:
+            continue
+        parts = values[0].split("|")
+        while len(parts) < 16:
+            parts.append("")
+        sources.append(
+            {
+                "id": parts[0],
+                "enabled": parts[1],
+                "profile": parts[2] or "blink-security-video",
+                "label": parts[3] or parts[0],
+                "pattern": parts[4] or "*",
+                "extensions": parts[5] or "mp4",
+                "telegram_mode": parts[6] or "auto",
+                "time_mode": parts[7] or "mtime",
+                "source_timezone": parts[8] or "UTC",
+                "display_timezone": parts[9] or "Europe/Berlin",
+                "last_file": parts[10],
+                "bot_var": parts[11],
+                "chat_var": parts[12],
+                "retries": parts[13] or "4",
+                "wait": parts[14] or "3",
+                "tmp_log": parts[15],
+            }
+        )
+    return sources
+
+
+def parse_shell_file(path):
+    env = {}
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as handle:
+            lines = handle.readlines()
+    except Exception:
+        return env
+    for line in lines:
+        parsed = parse_shell_assignment(line)
+        if parsed:
+            env[parsed[0]] = parsed[1]
+    return env
+
+
+def bool_config_value(value):
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    return str(value).strip().lower() in ("1", "true", "yes", "on", "ja", "an")
+
+
+def live_gate_state_exists():
+    if os.path.exists("/etc/vdisk-relay.live-enabled"):
+        return True
+    try:
+        return any(name.startswith("vdisk-relay.allow-") for name in os.listdir("/etc"))
+    except OSError:
+        return False
+
+
+def config_gate_enabled(path):
+    return os.path.exists("/etc/vdisk-relay.live-enabled") and os.path.exists(path)
+
+
+def config_gate_required(path):
+    if live_gate_state_exists():
+        return config_gate_enabled(path)
+    return True
+
+
+def config_missing_items(config, env, sources):
+    missing = []
+    require_telegram = (
+        config_gate_required("/etc/vdisk-relay.allow-sync")
+        or config_gate_required("/etc/vdisk-relay.allow-health-reboot")
+        or config_gate_required("/etc/vdisk-relay.allow-boot-notify")
+    )
+    require_archive = config_gate_required("/etc/vdisk-relay.allow-archive")
+
+    active = [source for source in sources if source.get("enabled") == "1"]
+    if require_telegram:
+        if not sources:
+            missing.append("sources")
+        if not active:
+            missing.append("active-source")
+        for source in active:
+            source_id = source.get("id") or "unknown"
+            bot_var = source.get("bot_var", "")
+            chat_var = source.get("chat_var", "")
+            if not source.get("id"):
+                missing.append("source-id")
+            if not source.get("pattern"):
+                missing.append(f"source-pattern:{source_id}")
+            if not bot_var or not env.get(bot_var):
+                missing.append(f"bot-token:{source_id}")
+            if not chat_var or not env.get(chat_var):
+                missing.append(f"chat-id:{source_id}")
+
+    if require_archive:
+        target = config.get("ARCHIVE_RSYNC_TARGET", "")
+        password_file = config.get("ARCHIVE_RSYNC_PASSWORD_FILE", "/root/vdisk-relay-rsync.pass")
+        if not target:
+            missing.append("archive-target")
+        if not password_file or not os.path.isfile(password_file):
+            missing.append("archive-password")
+
+    return missing
+
+
+def first_telegram_credentials(env, sources):
+    for source in sources:
+        if source.get("enabled") != "1":
+            continue
+        bot_var = source.get("bot_var", "")
+        chat_var = source.get("chat_var", "")
+        token = env.get(bot_var, "") if bot_var else ""
+        chat = env.get(chat_var, "") if chat_var else ""
+        if token and chat:
+            return token, chat, chat_var
+    return "", "", ""
+
+
+def default_notify_factors():
+    return {factor_id: {"alert": False, "clear": False} for factor_id, _label in MAINTENANCE_FACTORS}
+
+
+def load_notify_config():
+    data = load_json(MAINT_NOTIFY_CONFIG, {})
+    if not isinstance(data, dict):
+        data = {}
+    raw_factors = data.get("factors", {})
+    if not isinstance(raw_factors, dict):
+        raw_factors = {}
+    factors = default_notify_factors()
+    for factor_id in factors:
+        item = raw_factors.get(factor_id, {})
+        if not isinstance(item, dict):
+            item = {}
+        alert = bool_config_value(item.get("alert", item.get("enabled", False)))
+        clear = bool_config_value(item.get("clear", False)) and alert
+        factors[factor_id] = {"alert": alert, "clear": clear}
+    return {
+        "bot_var": str(data.get("bot_var", "")).strip(),
+        "chat_var": str(data.get("chat_var", "")).strip(),
+        "factors": factors,
+    }
+
+
+def module_present(modules_out, name):
+    return bool(re.search(r"^" + re.escape(name) + r"\s", modules_out or "", re.M))
+
+
+def unit_failed(units, unit):
+    data = units.get(unit, {})
+    return data.get("ActiveState") == "failed" or data.get("Result") == "failed"
+
+
+def unit_active(units, unit):
+    return units.get(unit, {}).get("ActiveState") == "active"
+
+
+def unit_not_failed(units, unit):
+    return not unit_failed(units, unit)
+
+
+def unit_enabled(units, unit):
+    return units.get(unit, {}).get("UnitFileState") == "enabled"
+
+
+def config_enabled(config, key, default):
+    return str(config.get(key, default)).strip() == "1"
+
+
+def maintenance_factors(modules_out, units, config, health_out, pending_info, pending_content, local_mount, loop_out):
+    rows = []
+
+    def add(factor_id, label, status, meaning, detail):
+        rows.append(
+            {
+                "id": factor_id,
+                "label": label,
+                "status": status,
+                "meaning": meaning,
+                "detail": detail or "-",
+            }
+        )
+
+    gadget_loaded = module_present(modules_out, "g_mass_storage")
+    dwc2_loaded = module_present(modules_out, "dwc2")
+    libcomposite_loaded = module_present(modules_out, "libcomposite")
+    bound_file = ""
+    try:
+        with open("/sys/module/g_mass_storage/parameters/file", "r", encoding="utf-8", errors="replace") as handle:
+            bound_file = handle.read().strip()
+    except Exception:
+        bound_file = ""
+
+    state_file = f"{STATE_DIR}/image-mtime.state"
+    stored_mtime = ""
+    try:
+        with open(state_file, "r", encoding="utf-8", errors="replace") as handle:
+            stored_mtime = handle.read().strip()
+    except Exception:
+        stored_mtime = ""
+
+    try:
+        current_mtime = str(int(os.stat(IMAGE_FILE).st_mtime))
+        image_exists = True
+    except Exception:
+        current_mtime = ""
+        image_exists = False
+
+    retry_state = units.get("vdisk-relay-retry-live.timer", {}).get("ActiveState", "")
+    queue_state = units.get("vdisk-relay-telegram-queue.timer", {}).get("ActiveState", "")
+    queue_service_state = units.get("vdisk-relay-telegram-queue.service", {}).get("ActiveState", "")
+    queue_service_result = units.get("vdisk-relay-telegram-queue.service", {}).get("Result", "")
+    watchdog_state = units.get("vdisk-relay-watchdog-live.timer", {}).get("ActiveState", "")
+    path_state = units.get("vdisk-relay-watch-live.path", {}).get("ActiveState", "")
+    live_fast_enabled = config_enabled(config, "LIVE_FAST_LANE_ENABLED", "1")
+    ultra_enabled = config_enabled(config, "ULTRA_FAST_LANE_ENABLED", "0")
+    fast_failed = unit_failed(units, "vdisk-relay-fast-sync.service")
+    ultra_failed = unit_failed(units, "vdisk-relay-ultra-fast-sync.service")
+
+    if gadget_loaded:
+        add("usb_gadget_module", "USB-Gadget Module", "OK", "g_mass_storage is loaded", "Host should still see a USB mass storage device.")
+    else:
+        add("usb_gadget_module", "USB-Gadget Module", "CRITICAL", "g_mass_storage missing", "watchdog-live attempts to restore the gadget outside the delivery path.")
+
+    if dwc2_loaded and libcomposite_loaded:
+        add("usb_gadget_basis", "USB-Gadget Base", "OK", "dwc2 and libcomposite are loaded", "Kernel basis for the gadget is available.")
+    else:
+        add("usb_gadget_basis", "USB-Gadget Base", "WATCH", "dwc2/libcomposite not fully loaded", "Watchdog attempts to load missing modules.")
+
+    if bound_file == IMAGE_FILE:
+        add("backing_image", "Backing-Image", "OK", "Gadget uses /usbdisk.img", "Bound image matches.")
+    elif bound_file:
+        add("backing_image", "Backing-Image", "CRITICAL", "Gadget uses a different image", bound_file)
+    else:
+        add("backing_image", "Backing-Image", "WATCH", "Backing file not readable", "Parameter /sys/module/g_mass_storage/parameters/file is unavailable.")
+
+    if not image_exists:
+        add("image_file", "Image File", "CRITICAL", "/usbdisk.img missing or not readable", "No functional gadget without image.")
+    else:
+        add("image_file", "Image File", "OK", "/usbdisk.img exists", "mtime can be checked.")
+
+    if not stored_mtime:
+        add("mtime_fallback", "mtime-Fallback", "WATCH", "Watchdog state not initialized yet", "After the next image-watchdog run this item should turn green.")
+    elif current_mtime and stored_mtime == current_mtime:
+        add("mtime_fallback", "mtime-Fallback", "OK", "Image mtime is synchronized with watchdog state", "No unnoticed image change is open.")
+    elif current_mtime:
+        add("mtime_fallback", "mtime-Fallback", "WATCH", "Image changed, watchdog state is not synchronized yet", "The next watchdog-live run will set or process pending state.")
+    else:
+        add("mtime_fallback", "mtime-Fallback", "CRITICAL", "Image mtime not readable", "mtime fallback cannot work.")
+
+    if pending_info.get("exists"):
+        add("pending_state", "Pending-State", "WATCH", "Sync pending", pending_content or "Pending file present.")
+    else:
+        add("pending_state", "Pending-State", "OK", "No open sync", "No unprocessed pending state present.")
+
+    if retry_state == "active":
+        add("retry_timer", "Retry-Timer", "OK", "retry-live.timer is active", "Fast retry only runs live-sync.")
+    else:
+        add("retry_timer", "Retry-Timer", "CRITICAL", "retry-live.timer is inactive", retry_state or "-")
+
+    if ultra_enabled:
+        detail = (
+            f"lane=ultra delay={config.get('ULTRA_FAST_LANE_DELAY_SECONDS', '0')}s "
+            f"quiet={config.get('ULTRA_FAST_LANE_QUIET_SECONDS', '0')}s "
+            f"sync_after={config.get('ULTRA_FAST_LANE_SYNC_AFTER_SEND', '1')} "
+            f"duplicate={config.get('ULTRA_FAST_DUPLICATE_MODE', 'filename')}"
+        )
+        if ultra_failed:
+            if pending_info.get("exists"):
+                add("fast_path", "Fast Path", "CRITICAL", "Ultra Fast Lane is active, but the ultra service failed while pending is open", detail)
+            else:
+                add("fast_path", "Fast Path", "WATCH", "Last Ultra Fast Lane attempt failed, but no pending state is open", detail)
+        else:
+            add("fast_path", "Fast Path", "OK", "Ultra Fast Lane is active", detail)
+    elif live_fast_enabled:
+        detail = (
+            f"lane=fast delay={config.get('LIVE_FAST_LANE_DELAY_SECONDS', '3')}s "
+            f"quiet={config.get('LIVE_FAST_QUIET_SECONDS', '3')}s"
+        )
+        if fast_failed:
+            if pending_info.get("exists"):
+                add("fast_path", "Fast Path", "CRITICAL", "Fast Lane is active, but the fast service failed while pending is open", detail)
+            else:
+                add("fast_path", "Fast Path", "WATCH", "Last Fast Lane attempt failed, but no pending state is open", detail)
+        else:
+            add("fast_path", "Fast Path", "OK", "Fast Lane is active", detail)
+    else:
+        add("fast_path", "Fast Path", "WATCH", "Fast Lane is disabled", "Retry timer remains fallback.")
+
+    if queue_state == "active" and queue_service_result != "failed":
+        add("telegram_queue", "Telegram-Queue", "OK", "telegram-queue.timer is active", "Telegram uploads run decoupled from the fast sync path.")
+    else:
+        detail = f"timer={queue_state or '-'} service={queue_service_state or '-'} result={queue_service_result or '-'}"
+        add("telegram_queue", "Telegram-Queue", "CRITICAL", "Telegram queue is not ready", detail)
+
+    if watchdog_state == "active":
+        add("watchdog_timer", "Watchdog-Timer", "OK", "watchdog-live.timer is active", "Gadget and image watchdog run periodically outside the delivery path.")
+    else:
+        add("watchdog_timer", "Watchdog-Timer", "CRITICAL", "watchdog-live.timer is inactive", watchdog_state or "-")
+
+    if path_state == "active":
+        add("inotify_path", "inotify-Path", "OK", "watch-live.path is active", "Normal changes are detected by inotify.")
+    else:
+        add("inotify_path", "inotify-Path", "WATCH", "inotify path is inactive", "mtime fallback remains active as safeguard.")
+
+    if (health_out or "").startswith("OK "):
+        add("video_freshness", "Data-Freshness", "OK", "Newest active video is inside the time window", health_out)
+    elif "STALE" in (health_out or "") or "CRITICAL" in (health_out or ""):
+        add("video_freshness", "Data-Freshness", "CRITICAL", "Newest active video is too old or missing", health_out)
+    else:
+        add("video_freshness", "Data-Freshness", "WATCH", "Health output is ambiguous", health_out)
+
+    if local_mount:
+        add("local_mount", "Local Mount", "WATCH", "Image is locally mounted", MOUNTPOINT)
+    else:
+        add("local_mount", "Local Mount", "OK", "Image is not locally mounted", "Normal idle state.")
+
+    if loop_out and not loop_out.startswith("OK:"):
+        add("loopdevice", "Loopdevice", "WATCH", "Loop device active on /usbdisk.img", loop_out)
+    else:
+        add("loopdevice", "Loopdevice", "OK", "No local loop active", "Normal idle state.")
+
+    return rows
+
+
+def preview_counts():
+    index_count = 0
+    try:
+        data = load_json(PREVIEW_INDEX, {})
+        if isinstance(data, dict):
+            raw_count = data.get("count")
+            if isinstance(raw_count, int):
+                index_count = raw_count
+            else:
+                index_count = len(data)
+        elif isinstance(data, list):
+            index_count = len(data)
+    except Exception:
+        index_count = 0
+
+    backlog_total = 0
+    backlog_ignored = 0
+    backlog = load_json(PREVIEW_BACKLOG, {})
+    if isinstance(backlog, dict):
+        items = backlog.values()
+    elif isinstance(backlog, list):
+        items = backlog
+    else:
+        items = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        backlog_total += 1
+        if bool_config_value(item.get("ignored", False)):
+            backlog_ignored += 1
+    return index_count, backlog_total, backlog_ignored
+
+
+def queue_count(state):
+    path = os.path.join(STATE_DIR, "telegram-queue", state)
+    try:
+        return sum(1 for name in os.listdir(path) if name.endswith(".json"))
+    except Exception:
+        return 0
+
+
+def add_component(components, state, name, message):
+    normalized = normalize_status_state(state)
+    components.append(
+        {
+            "id": status_component_id(name),
+            "name": name,
+            "state": normalized,
+            "message": str(message or "-"),
+        }
+    )
+
+
+def component_line(component):
+    state = normalize_status_state(component.get("state", "FAIL"))
+    name = component.get("name", "Unknown")
+    message = component.get("message", "-")
+    prefix = STATUS_PREFIXES.get(state, STATUS_PREFIXES["UNKNOWN"])
+    return f"{prefix}{name:<22} {message}"
+
+
+def render_status_lights(components):
+    return "\n".join(component_line(component) for component in components)
+
+
+def render_status_text(data):
+    status_lights = data.get("status_lights", "")
+    overall = data.get("overall", {})
+    if isinstance(overall, dict):
+        exitcode = int(overall.get("exitcode", 1))
+    else:
+        exitcode = 0 if overall == "OK" else 2
+    return (
+        "=== vdisk-relay status ===\n"
+        + status_lights.rstrip()
+        + "\nexitcode="
+        + str(exitcode)
+        + "\nupdated="
+        + str(data.get("generated_at", ""))
+        + "\n"
+    )
+
+
+def health_component_state(health):
+    try:
+        rc = int(health.get("rc", 1)) if isinstance(health, dict) else 1
+    except Exception:
+        rc = 1
+    out = str(health.get("out", "") if isinstance(health, dict) else "")
+    upper = out.upper()
+    if rc == 0 and (out == "OK" or out.startswith("OK ")):
+        return "OK"
+    if any(marker in upper for marker in ("STALE", "CRITICAL", "FAIL", "ERROR")):
+        return "FAIL"
+    if rc != 0:
+        return "FAIL"
+    return "UNKNOWN"
+
+
+def build_status_components(config, env, sources, units, modules, health, pending_info, pending_content, local_mount, loop_state):
+    components = []
+
+    preview_index_count, preview_backlog_total, preview_backlog_ignored = preview_counts()
+    cache_timer_ok = unit_active(units, "vdisk-relay-preview-cache.timer") or unit_active(units, "vdisk-relay-preview-cache.service")
+    if os.path.isfile(PREVIEW_INDEX) and os.path.getsize(PREVIEW_INDEX) > 0 and cache_timer_ok and unit_not_failed(units, "vdisk-relay-preview-cache.service"):
+        add_component(
+            components,
+            "OK",
+            "Previews",
+            f"index={preview_index_count}, backlog={preview_backlog_total} (ignored={preview_backlog_ignored}), timer active",
+        )
+    else:
+        add_component(
+            components,
+            "FAIL",
+            "Previews",
+            f"index={preview_index_count}, backlog={preview_backlog_total} (ignored={preview_backlog_ignored}), timer/starter inactive or index missing",
+        )
+
+    gate_files = [
+        "/etc/vdisk-relay.live-enabled",
+        "/etc/vdisk-relay.allow-gadget",
+        "/etc/vdisk-relay.allow-watch",
+        "/etc/vdisk-relay.allow-trigger",
+        "/etc/vdisk-relay.allow-sync",
+        "/etc/vdisk-relay.allow-archive",
+        "/etc/vdisk-relay.allow-health-reboot",
+        "/etc/vdisk-relay.allow-boot-notify",
+    ]
+    missing_gates = [os.path.basename(path) for path in gate_files if not os.path.exists(path)]
+    if missing_gates:
+        add_component(components, "FAIL", "Gates", "missing: " + " ".join(missing_gates))
+    else:
+        add_component(components, "OK", "Gates", "all live gates present")
+
+    missing_config = config_missing_items(config, env, sources)
+    if missing_config:
+        add_component(components, "FAIL", "Configuration", "missing: " + " ".join(missing_config))
+    else:
+        add_component(components, "OK", "Configuration", "source, Telegram and archive configured")
+
+    if unit_active(units, "vdisk-relay-gadget-live.service") and module_present(modules["out"], "g_mass_storage"):
+        add_component(components, "OK", "USB-Gadget", "g_mass_storage loaded")
+    else:
+        add_component(components, "FAIL", "USB-Gadget", "service or module inactive")
+
+    if unit_active(units, "vdisk-relay-watch-live.path") and unit_not_failed(units, "vdisk-relay-trigger-live.service"):
+        add_component(components, "OK", "Watch/Trigger", "path trigger active")
+    else:
+        add_component(components, "FAIL", "Watch/Trigger", "path trigger inactive or trigger failed")
+
+    if pending_info.get("exists"):
+        add_component(components, "PENDING", "Pending-State", pending_content or "pending file present")
+    else:
+        add_component(components, "OK", "Pending-State", "no unprocessed pending state present")
+
+    loop_active = bool(loop_state["out"] and not loop_state["out"].startswith("OK:"))
+    if unit_not_failed(units, "vdisk-relay-sync-live.service") and not local_mount and not loop_active:
+        add_component(components, "OK", "Live-Sync", "no local mount/loop, service not failed")
+    else:
+        add_component(components, "FAIL", "Live-Sync", "sync failed or mount/loop active")
+
+    if unit_active(units, "vdisk-relay-retry-live.timer") and unit_not_failed(units, "vdisk-relay-retry-live.service"):
+        add_component(components, "OK", "Retry", "timer active, fast sync path")
+    else:
+        add_component(components, "FAIL", "Retry", "timer inactive or service failed")
+
+    if config_enabled(config, "ULTRA_FAST_LANE_ENABLED", "0"):
+        detail = (
+            f"ultra active, delay={config.get('ULTRA_FAST_LANE_DELAY_SECONDS', '0')}s, "
+            f"quiet={config.get('ULTRA_FAST_LANE_QUIET_SECONDS', '0')}s, "
+            f"duplicate={config.get('ULTRA_FAST_DUPLICATE_MODE', 'filename')}, "
+            f"fifo={config.get('ULTRA_FAST_REMAINDER_QUEUE_ENABLED', '1')}/{config.get('ULTRA_FAST_REMAINDER_QUEUE_DELAY_SECONDS', '2')}s"
+        )
+        if unit_not_failed(units, "vdisk-relay-ultra-fast-sync.service"):
+            add_component(components, "OK", "Fast-Path", detail)
+        elif pending_info.get("exists"):
+            add_component(components, "FAIL", "Fast-Path", "ultra active, but ultra-fast-sync failed while pending is open")
+        else:
+            add_component(components, "WARN", "Fast-Path", "ultra active; last ultra-fast-sync failed, no pending state open")
+    elif config_enabled(config, "LIVE_FAST_LANE_ENABLED", "1"):
+        detail = f"fast active, delay={config.get('LIVE_FAST_LANE_DELAY_SECONDS', '3')}s, quiet={config.get('LIVE_FAST_QUIET_SECONDS', '3')}s"
+        if unit_not_failed(units, "vdisk-relay-fast-sync.service"):
+            add_component(components, "OK", "Fast-Path", detail)
+        elif pending_info.get("exists"):
+            add_component(components, "FAIL", "Fast-Path", "fast active, but fast-sync failed while pending is open")
+        else:
+            add_component(components, "WARN", "Fast-Path", "fast active; last fast-sync failed, no pending state open")
+    else:
+        add_component(components, "DISABLED", "Fast-Path", "disabled, retry timer remains fallback")
+
+    if unit_active(units, "vdisk-relay-image-mtime-watch.timer") and unit_not_failed(units, "vdisk-relay-image-mtime-watch.service"):
+        add_component(components, "OK", "MTime-Fallback", "lightweight image mtime check active")
+    else:
+        add_component(components, "FAIL", "MTime-Fallback", "timer inactive or service failed")
+
+    if unit_active(units, "vdisk-relay-watchdog-live.timer") and unit_not_failed(units, "vdisk-relay-watchdog-live.service"):
+        add_component(components, "OK", "Watchdog-Timer", "timer active, gadget/image separated from delivery path")
+    else:
+        add_component(components, "FAIL", "Watchdog-Timer", "timer inactive or service failed")
+
+    health_state = health_component_state(health)
+    add_component(components, health_state, "Data/Health", health["out"] or "health command failed")
+
+    active_sources = [source for source in sources if source.get("enabled") == "1"]
+    missing_telegram = []
+    for source in active_sources:
+        bot_var = source.get("bot_var", "")
+        chat_var = source.get("chat_var", "")
+        if not bot_var or not env.get(bot_var) or not chat_var or not env.get(chat_var):
+            missing_telegram.append(source.get("id") or "unknown")
+    if active_sources and not missing_telegram:
+        add_component(components, "OK", "Telegram-File", "configuration for active sources present")
+    else:
+        add_component(components, "FAIL", "Telegram-File", "missing token/chat ID for: " + " ".join(missing_telegram))
+
+    queue_pending = queue_count("pending")
+    queue_failed = queue_count("failed")
+    if str(config.get("TELEGRAM_QUEUE_ENABLED", "1")) != "1":
+        add_component(components, "DISABLED", "Telegram-Queue", "disabled, direct sending active")
+    elif unit_active(units, "vdisk-relay-telegram-queue.timer") and unit_not_failed(units, "vdisk-relay-telegram-queue.service"):
+        add_component(components, "OK", "Telegram-Queue", f"timer active, pending={queue_pending}, failed={queue_failed}")
+    else:
+        add_component(components, "FAIL", "Telegram-Queue", f"timer inactive or service failed, pending={queue_pending}, failed={queue_failed}")
+
+    token, chat, _chat_var = first_telegram_credentials(env, sources)
+    if unit_enabled(units, "vdisk-relay-boot-notify-live.service") and unit_not_failed(units, "vdisk-relay-boot-notify-live.service") and token and chat:
+        add_component(components, "OK", "Boot notify", "enabled, not failed, Telegram config present")
+    else:
+        add_component(components, "FAIL", "Boot notify", "not enabled, failed or Telegram config missing")
+
+    archive_password = config.get("ARCHIVE_RSYNC_PASSWORD_FILE", "/root/vdisk-relay-rsync.pass")
+    if (
+        unit_active(units, "vdisk-relay-archive-live.timer")
+        and unit_not_failed(units, "vdisk-relay-archive-live.service")
+        and config.get("ARCHIVE_RSYNC_TARGET", "")
+        and archive_password
+        and os.path.isfile(archive_password)
+    ):
+        add_component(components, "OK", "Archive", "timer active, rsync-daemon target configured")
+    else:
+        add_component(components, "FAIL", "Archive", "timer inactive, service failed or rsync config missing")
+
+    if unit_active(units, "vdisk-relay-health-live.timer") and unit_not_failed(units, "vdisk-relay-health-live.service"):
+        add_component(components, "OK", "Health-Timer", "timer active")
+    else:
+        add_component(components, "FAIL", "Health-Timer", "timer inactive or service failed")
+
+    overall = overall_state_from_components(components)
+    if overall == "FAIL":
+        add_component(components, "FAIL", "Overall", "at least one base function red")
+    elif overall == "WARN":
+        add_component(components, "WARN", "Overall", "at least one base function needs attention")
+    else:
+        add_component(components, "OK", "Overall", "all base functions green")
+    return components
+
+
+def maintenance_notify_preview():
+    config = load_notify_config()
+    env = parse_env_file()
+    bot_var = config.get("bot_var", "")
+    chat_var = config.get("chat_var", "")
+    return {
+        "enabled": os.path.exists(MAINT_NOTIFY_ALLOW),
+        "ready": bool(bot_var and chat_var and env.get(bot_var, "") and env.get(chat_var, "")),
+        "checked": False,
+        "sent": [],
+        "last_error": "",
+        "note": "suppressed in no-write mode",
+    }
+
+
+def telegram_message(title, factor, clear=False):
+    prefix = "[OK]" if clear else "[WARN]"
+    lines = [
+        f"{prefix} <b>{html.escape(title)}</b>",
+        f"<b>Host:</b> {html.escape(socket.gethostname())}",
+        f"<b>Factor:</b> {html.escape(factor.get('label', '-'))}",
+        f"<b>State:</b> {html.escape(factor.get('status', '-'))}",
+        f"<b>Meaning:</b> {html.escape(factor.get('meaning', '-'))}",
+        f"<b>Detail:</b> {html.escape(str(factor.get('detail', '-'))[:500])}",
+    ]
+    return "\n".join(lines)
+
+
+def send_telegram(token, chat_id, text):
+    if not token or not chat_id:
+        return False, "Telegram token or chat missing"
+    payload = urlencode(
+        {
+            "parse_mode": "HTML",
+            "chat_id": chat_id,
+            "text": text,
+        }
+    ).encode("utf-8")
+    req = Request(
+        f"https://api.telegram.org/bot{token}/sendMessage",
+        data=payload,
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+        method="POST",
+    )
+    try:
+        with urlopen(req, timeout=TELEGRAM_SEND_TIMEOUT_SECONDS) as response:
+            body = response.read(4096).decode("utf-8", errors="replace")
+            if response.status == 200 and '"ok":true' in body.replace(" ", ""):
+                return True, "ok"
+            return False, f"http={response.status} body={body[:180]}"
+    except Exception as exc:
+        return False, str(exc)[:180]
+
+
+def process_maintenance_notifications(factors):
+    now_epoch = int(time.time())
+    now = datetime.now().astimezone().isoformat()
+    config = load_notify_config()
+    env = parse_env_file()
+    enabled = os.path.exists(MAINT_NOTIFY_ALLOW)
+    bot_var = config.get("bot_var", "")
+    chat_var = config.get("chat_var", "")
+    token = env.get(bot_var, "") if bot_var else ""
+    chat_id = env.get(chat_var, "") if chat_var else ""
+    ready = bool(bot_var and chat_var and token and chat_id)
+    old_state = load_json(MAINT_NOTIFY_STATE, {})
+    if not isinstance(old_state, dict):
+        old_state = {}
+    old_factors = old_state.get("factors", {})
+    if not isinstance(old_factors, dict):
+        old_factors = {}
+
+    interval = MAINT_NOTIFY_DEFAULT_INTERVAL_SECONDS
+    try:
+        interval = int(env.get("MAINT_NOTIFY_INTERVAL_SECONDS", interval))
+    except Exception:
+        interval = MAINT_NOTIFY_DEFAULT_INTERVAL_SECONDS
+    interval = max(300, min(86400, interval))
+
+    last_check_epoch = 0
+    try:
+        last_check_epoch = int(old_state.get("last_check_epoch", 0))
+    except Exception:
+        last_check_epoch = 0
+
+    if last_check_epoch > 0 and now_epoch - last_check_epoch < interval:
+        return {
+            "enabled": enabled,
+            "ready": ready,
+            "sent": [],
+            "last_error": old_state.get("last_error", "") if isinstance(old_state, dict) else "",
+            "checked": False,
+            "next_check_seconds": interval - (now_epoch - last_check_epoch),
+        }
+
+    new_state = {
+        "generated_at": now,
+        "last_check_epoch": now_epoch,
+        "interval_seconds": interval,
+        "enabled": enabled,
+        "ready": ready,
+        "bot_var": bot_var,
+        "chat_var": chat_var,
+        "last_send": old_state.get("last_send", ""),
+        "last_error": "",
+        "factors": {},
+    }
+    sent = []
+
+    for factor in factors:
+        factor_id = factor.get("id", "")
+        status = factor.get("status", "")
+        problem = status != "OK"
+        factor_config = config["factors"].get(factor_id, {"alert": False, "clear": False})
+        alert_enabled = bool(factor_config.get("alert"))
+        clear_enabled = bool(factor_config.get("clear")) and alert_enabled
+        previous = old_factors.get(factor_id, {}) if isinstance(old_factors.get(factor_id, {}), dict) else {}
+
+        item_state = {
+            "label": factor.get("label", factor_id),
+            "last_status": status,
+            "alert_active": False,
+            "last_sent_status": previous.get("last_sent_status", ""),
+        }
+
+        if not enabled or not ready or not alert_enabled:
+            new_state["factors"][factor_id] = item_state
+            continue
+
+        if problem:
+            should_send = (not previous.get("alert_active")) or previous.get("last_sent_status") != status
+            if should_send:
+                ok, detail = send_telegram(token, chat_id, telegram_message("VDisk Relay maintenance", factor, clear=False))
+                if ok:
+                    item_state["alert_active"] = True
+                    item_state["last_sent_status"] = status
+                    item_state["last_sent_at"] = now
+                    new_state["last_send"] = f"{now} {factor.get('label', factor_id)} {status}"
+                    sent.append({"factor": factor_id, "status": status, "type": "alert"})
+                    log_line("WARN", f"maintenance notify alert sent factor={factor_id} status={status}")
+                else:
+                    item_state["alert_active"] = bool(previous.get("alert_active"))
+                    item_state["last_sent_status"] = previous.get("last_sent_status", "")
+                    new_state["last_error"] = f"{factor_id}: {detail}"
+                    log_line("ERROR", f"maintenance notify alert failed factor={factor_id}: {detail}")
+            else:
+                item_state["alert_active"] = True
+                item_state["last_sent_status"] = previous.get("last_sent_status", status)
+                item_state["last_sent_at"] = previous.get("last_sent_at", "")
+        else:
+            if previous.get("alert_active") and clear_enabled:
+                ok, detail = send_telegram(token, chat_id, telegram_message("VDisk Relay maintenance OK again", factor, clear=True))
+                if ok:
+                    new_state["last_send"] = f"{now} {factor.get('label', factor_id)} OK"
+                    sent.append({"factor": factor_id, "status": "OK", "type": "clear"})
+                    log_line("INFO", f"maintenance notify clear sent factor={factor_id}")
+                else:
+                    new_state["last_error"] = f"{factor_id}: {detail}"
+                    log_line("ERROR", f"maintenance notify clear failed factor={factor_id}: {detail}")
+            item_state["last_sent_status"] = "OK"
+
+        new_state["factors"][factor_id] = item_state
+
+    write_json_atomic(MAINT_NOTIFY_STATE, new_state, 0o644)
+    return {
+        "enabled": enabled,
+        "ready": ready,
+        "sent": sent,
+        "last_error": new_state.get("last_error", ""),
+        "checked": True,
+        "interval_seconds": interval,
+    }
+
+
+def build_status(write_side_effects=True):
+    os.makedirs(RUN_DIR, mode=0o755, exist_ok=True)
+    os.makedirs(STATE_DIR, mode=0o755, exist_ok=True)
+
+    health = run("/usr/local/sbin/vdisk-relay health", 6)
+    timers = run("systemctl list-timers --all | grep vdisk-relay || true", 6)
+    failed_units = run("systemctl --failed || true", 6)
+    modules = run("lsmod | grep -E 'g_mass_storage|usb_f_mass_storage|dwc2|libcomposite|roles' || true", 4)
+    local_mount = run(f"mountpoint -q {MOUNTPOINT} && findmnt {MOUNTPOINT} || echo 'OK: vdisk not locally mounted'", 4)
+    loop_state = run(f"losetup -j {IMAGE_FILE} || echo 'OK: no loop'", 4)
+
+    log_lines = tail_file(LOG_FILE, 160)
+
+    units = {u: parse_systemctl_show(u) for u in UNITS}
+    config = parse_config_file()
+    env = parse_env_file()
+    sources = parse_sources()
+
+    pending_info = file_info(f"{RUN_DIR}/pending")
+    pending_content = ""
+    if pending_info.get("exists"):
+        try:
+            with open(f"{RUN_DIR}/pending", "r", encoding="utf-8", errors="replace") as f:
+                pending_content = f.read().strip()
+        except Exception:
+            pending_content = ""
+
+    image = file_info(IMAGE_FILE)
+    maintenance_detection_factors = maintenance_factors(
+        modules["out"],
+        units,
+        config,
+        health["out"],
+        pending_info,
+        pending_content,
+        os.path.ismount(MOUNTPOINT),
+        loop_state["out"],
+    )
+    if write_side_effects:
+        maintenance_notify = process_maintenance_notifications(maintenance_detection_factors)
+    else:
+        maintenance_notify = maintenance_notify_preview()
+
+    status_components = build_status_components(
+        config,
+        env,
+        sources,
+        units,
+        modules,
+        health,
+        pending_info,
+        pending_content,
+        os.path.ismount(MOUNTPOINT),
+        loop_state,
+    )
+    status_lights = render_status_lights(status_components)
+    overall_state = normalize_status_state(status_components[-1]["state"])
+    exitcode = status_exitcode_for_state(overall_state)
+    generated_at = datetime.now().astimezone().isoformat()
+
+    data = {
+        "schema_version": 2,
+        "generated_at": generated_at,
+        "valid": True,
+        "host": socket.gethostname(),
+        "overall": {
+            "state": overall_state,
+            "message": status_components[-1]["message"],
+            "exitcode": exitcode,
+        },
+        "overall_state": overall_state,
+        "status_lights": status_lights,
+        "status_components": status_components,
+        "health": health["out"],
+        "timers": timers["out"],
+        "failed_units": failed_units["out"],
+        "runtime": {
+            "modules": modules["out"],
+            "g_mass_storage_loaded": bool(re.search(r"^g_mass_storage\\s", modules["out"], re.M)),
+            "local_mount": local_mount["out"],
+            "loop_state": loop_state["out"],
+            "image": image,
+            "pending": pending_info,
+            "pending_content": pending_content,
+        },
+        "maintenance_detection": {
+            "factors": maintenance_detection_factors,
+            "notify": maintenance_notify,
+        },
+        "units": units,
+        "recent": {
+            "last_live_sync_success": grep_last(log_lines, r"live-sync: successful"),
+            "last_live_sync_info": grep_last(log_lines, r"live-sync:"),
+            "last_archive": grep_last(log_lines, r"ARCHIVE"),
+            "last_telegram_video": grep_last(log_lines, r"SEND-OK|SEND-FAILED|TEST-VIDEO-SEND"),
+            "last_boot_notify": grep_last(log_lines, r"telegram text send ok|boot-notify"),
+            "last_error": grep_last(log_lines, r"\\[ERROR\\]|FAIL|failed"),
+        },
+        "log_tail": "\n".join(log_lines[-120:]),
+    }
+
+    return data
+
+
+def minimal_failure_status(message):
+    generated_at = datetime.now().astimezone().isoformat()
+    components = [
+        {
+            "id": "status_cache",
+            "name": "Status-Cache",
+            "state": "FAIL",
+            "message": message,
+        },
+        {
+            "id": "overall",
+            "name": "Overall",
+            "state": "FAIL",
+            "message": "status cache unavailable",
+        },
+    ]
+    status_lights = render_status_lights(components)
+    return {
+        "schema_version": 2,
+        "generated_at": generated_at,
+        "valid": False,
+        "host": socket.gethostname(),
+        "overall": {"state": "FAIL", "message": "status cache unavailable", "exitcode": 1},
+        "overall_state": "FAIL",
+        "status_lights": status_lights,
+        "status_components": components,
+        "health": "",
+        "timers": "",
+        "failed_units": "",
+        "runtime": {},
+        "maintenance_detection": {"factors": [], "notify": {}},
+        "units": {},
+        "recent": {},
+        "log_tail": "",
+    }
+
+
+def cache_is_valid():
+    data = load_json(JSON_OUT, {})
+    return isinstance(data, dict) and bool(data.get("valid")) and bool(data.get("status_components"))
+
+
+def write_status_outputs(data):
+    text = render_status_text(data)
+    write_atomic(TEXT_OUT, text, 0o644)
+    write_atomic(JSON_OUT, json.dumps(data, ensure_ascii=False, indent=2) + "\n", 0o644)
+
+
+def write_attempt(status, message="", data=None):
+    payload = {
+        "generated_at": datetime.now().astimezone().isoformat(),
+        "status": status,
+        "message": str(message or ""),
+    }
+    if isinstance(data, dict):
+        payload["status_generated_at"] = data.get("generated_at", "")
+        payload["overall_state"] = data.get("overall_state", "")
+    write_json_atomic(ATTEMPT_OUT, payload, 0o644)
+
+
+def main(argv=None):
+    argv = list(sys.argv[1:] if argv is None else argv)
+    no_write = False
+    stdout = False
+    for arg in argv:
+        if arg == "--no-write":
+            no_write = True
+        elif arg == "--stdout":
+            stdout = True
+        else:
+            print(f"Unknown option: {arg}", file=sys.stderr)
+            return 1
+
+    try:
+        data = build_status(write_side_effects=not no_write)
+    except Exception as exc:
+        message = str(exc)[:500]
+        log_line("ERROR", f"status build failed: {message}")
+        if stdout or no_write:
+            data = minimal_failure_status(message)
+            sys.stdout.write(render_status_text(data))
+            return 1
+        write_attempt("error", message)
+        if cache_is_valid():
+            return 1
+        data = minimal_failure_status(message)
+        write_status_outputs(data)
+        return 1
+
+    if stdout:
+        sys.stdout.write(render_status_text(data))
+
+    if not no_write:
+        write_status_outputs(data)
+        write_attempt("ok", data=data)
+
+    if stdout or no_write:
+        overall = data.get("overall", {})
+        if isinstance(overall, dict):
+            try:
+                return int(overall.get("exitcode", 1))
+            except Exception:
+                return 1
+        return status_exitcode_for_state(data.get("overall_state"))
+
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

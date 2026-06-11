@@ -1,0 +1,14 @@
+[Unit]
+Description=vdisk-relay live retry pending sync
+After=local-fs.target
+ConditionPathExists=/usr/local/sbin/vdisk-relay
+ConditionPathExists=/usbdisk.img
+ConditionPathExists=/etc/vdisk-relay.live-enabled
+ConditionPathExists=/etc/vdisk-relay.allow-sync
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/vdisk-relay live-sync
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7

@@ -1,0 +1,15 @@
+[Unit]
+Description=vdisk-relay Telegram queue worker
+After=network-online.target
+Wants=network-online.target
+ConditionPathExists=/usr/local/sbin/vdisk-relay
+ConditionPathExists=/etc/vdisk-relay.live-enabled
+ConditionPathExists=/etc/vdisk-relay.allow-sync
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/vdisk-relay telegram-queue-worker
+TimeoutStartSec=30min
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7

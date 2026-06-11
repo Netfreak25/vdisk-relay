@@ -1,0 +1,13 @@
+[Unit]
+Description=vdisk-relay archive timer
+ConditionPathExists=/etc/vdisk-relay.live-enabled
+ConditionPathExists=/etc/vdisk-relay.allow-archive
+
+[Timer]
+OnBootSec=10min
+OnUnitActiveSec=1h
+AccuracySec=5min
+Unit=vdisk-relay-archive-live.service
+
+[Install]
+WantedBy=timers.target

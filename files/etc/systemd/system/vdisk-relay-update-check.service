@@ -1,0 +1,9 @@
+[Unit]
+Description=vdisk-relay update availability check
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+TimeoutStartSec=3min
+ExecStart=/usr/local/sbin/vdisk-relay-update-check

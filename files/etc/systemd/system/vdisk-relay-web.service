@@ -1,0 +1,17 @@
+[Unit]
+Description=vdisk-relay status and source admin web page
+After=network.target
+Wants=vdisk-relay-web-status-cache.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/sbin/vdisk-relay-web-admin
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=5s
+Nice=-1
+CPUAccounting=yes
+CPUWeight=200
+
+[Install]
+WantedBy=multi-user.target

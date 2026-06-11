@@ -1,0 +1,11 @@
+[Unit]
+Description=vdisk-relay web status cache timer
+
+[Timer]
+OnBootSec=30s
+OnUnitActiveSec=60s
+AccuracySec=10s
+Unit=vdisk-relay-web-status-cache.service
+
+[Install]
+WantedBy=timers.target

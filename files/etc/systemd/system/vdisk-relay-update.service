@@ -1,0 +1,9 @@
+[Unit]
+Description=Run controlled vdisk-relay update
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+TimeoutStartSec=30min
+ExecStart=/usr/local/sbin/vdisk-relay-update-run

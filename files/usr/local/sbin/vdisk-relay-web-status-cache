@@ -1,0 +1,77 @@
+#!/bin/bash
+set -u
+
+OUTDIR="/run/vdisk-relay-www"
+OUT="${OUTDIR}/index.html"
+TMP="${OUT}.tmp"
+STATUS_TXT="${OUTDIR}/status.txt"
+
+mkdir -p "$OUTDIR"
+chmod 0755 "$OUTDIR"
+
+if /usr/local/sbin/vdisk-relay status-lights > "$STATUS_TXT" 2>&1; then
+  OVERALL="OK"
+else
+  OVERALL="FAIL"
+fi
+
+HOST="$(hostname)"
+NOW="$(date -Is)"
+
+{
+cat <<HTML
+<!doctype html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta http-equiv="refresh" content="30">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>vdisk-relay State - ${HOST}</title>
+<style>
+:root { font-family: system-ui, sans-serif; color-scheme: dark; }
+body { margin: 2rem; background: #111; color: #eee; }
+.card { max-width: 980px; border: 1px solid #333; border-radius: 12px; padding: 1.2rem 1.4rem; background: #181818; }
+h1 { margin: 0 0 .3rem 0; font-size: 1.6rem; }
+.meta { color: #aaa; margin-bottom: 1rem; }
+.badge { display: inline-block; padding: .25rem .7rem; border-radius: 999px; font-weight: 700; }
+.badge.ok { background: #0f5132; color: #c7f5d9; }
+.badge.fail { background: #842029; color: #ffd6d6; }
+pre { font-size: 1rem; line-height: 1.45; white-space: pre-wrap; }
+.okline { color: #5ee787; }
+.failline { color: #ff7b72; font-weight: 700; }
+.other { color: #ddd; }
+</style>
+</head>
+<body>
+<div class="card">
+<h1>vdisk-relay State</h1>
+<div class="meta">Host: ${HOST} · Aktualisiert: ${NOW}</div>
+HTML
+
+if [ "$OVERALL" = "OK" ]; then
+  echo '<div class="badge ok">GESAMTSTATUS OK</div>'
+else
+  echo '<div class="badge fail">GESAMTSTATUS FAIL</div>'
+fi
+
+echo '<pre>'
+
+while IFS= read -r line; do
+  esc="$(printf '%s\n' "$line" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g')"
+  case "$line" in
+    OK*)   printf '<span class="okline">%s</span>\n' "$esc" ;;
+    FAIL*) printf '<span class="failline">%s</span>\n' "$esc" ;;
+    *)     printf '<span class="other">%s</span>\n' "$esc" ;;
+  esac
+done < "$STATUS_TXT"
+
+cat <<HTML
+</pre>
+</div>
+</body>
+</html>
+HTML
+} > "$TMP"
+
+mv -f "$TMP" "$OUT"
+chmod 0644 "$OUT" "$STATUS_TXT"

@@ -1,0 +1,328 @@
+#!/usr/bin/env python3
+import datetime
+import fcntl
+import json
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+
+STATE_DIR = "/var/lib/vdisk-relay"
+UPDATE_DIR = f"{STATE_DIR}/update"
+REPO_ROOT_FILE = f"{STATE_DIR}/repo-root"
+STATUS_FILE = f"{UPDATE_DIR}/update-status.json"
+LOG_FILE = f"{UPDATE_DIR}/update.log"
+LOCK_FILE = f"{UPDATE_DIR}/update.lock"
+UPDATE_CHECK = "/usr/local/sbin/vdisk-relay-update-check"
+GIT_CREDENTIALS_FILE = f"{STATE_DIR}/git-credentials.json"
+GIT_ASKPASS = "/usr/local/sbin/vdisk-relay-git-askpass"
+
+
+def now_iso():
+    return datetime.datetime.now(datetime.timezone.utc).astimezone().isoformat(timespec="seconds")
+
+
+def read_file(path, default=""):
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as handle:
+            return handle.read()
+    except FileNotFoundError:
+        return default
+
+
+def trim(text, limit=1600):
+    text = (text or "").strip()
+    if len(text) <= limit:
+        return text
+    return text[:limit] + "... [gekuerzt]"
+
+
+def git_credentials_status():
+    try:
+        with open(GIT_CREDENTIALS_FILE, "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+    except Exception:
+        return {"configured": False, "message": "Git credentials missing"}
+
+    username = str(data.get("username", ""))
+    token = str(data.get("token", ""))
+    return {
+        "configured": bool(username and token),
+        "username": username,
+        "token_present": bool(token),
+        "message": "Git credentials stored" if username and token else "Git-Credentials incomplete",
+    }
+
+
+def disable_update_units_without_credentials(log_func=None):
+    systemctl = shutil.which("systemctl") or "/bin/systemctl"
+    try:
+        subprocess.run(
+            [systemctl, "disable", "--now", "vdisk-relay-update-check.timer"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=15,
+            check=False,
+        )
+        subprocess.run(
+            [systemctl, "stop", "vdisk-relay-update-check.service"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=15,
+            check=False,
+        )
+        if log_func:
+            log_func("update units disabled because git credentials are missing")
+    except Exception as exc:
+        if log_func:
+            log_func("update unit disable failed: " + str(exc))
+
+
+class UpdateJob:
+    def __init__(self):
+        os.makedirs(UPDATE_DIR, mode=0o755, exist_ok=True)
+        self.job_id = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%d-%H%M%S")
+        self.started_at = now_iso()
+        self.old_commit = ""
+        self.new_commit = ""
+        self.exit_code = None
+        self.diagnostics = ""
+        self.service_checks = {}
+        self.web_check = ""
+
+    def write_status(self, status, phase, message, running=True, exit_code=None, finished_at=""):
+        data = {
+            "job_id": self.job_id,
+            "status": status,
+            "phase": phase,
+            "message": message,
+            "started_at": self.started_at,
+            "finished_at": finished_at,
+            "old_commit": self.old_commit,
+            "new_commit": self.new_commit,
+            "exit_code": exit_code if exit_code is not None else self.exit_code,
+            "running": running,
+            "diagnostics": trim(self.diagnostics),
+            "log_file": LOG_FILE,
+            "status_file": STATUS_FILE,
+            "service_checks": self.service_checks,
+            "web_check": self.web_check,
+            "completion_marker": status if not running else "",
+        }
+        fd, tmp = tempfile.mkstemp(prefix=os.path.basename(STATUS_FILE) + ".", dir=UPDATE_DIR)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                json.dump(data, handle, ensure_ascii=False, indent=2, sort_keys=True)
+                handle.write("\n")
+            os.chmod(tmp, 0o644)
+            os.replace(tmp, STATUS_FILE)
+        finally:
+            if os.path.exists(tmp):
+                os.unlink(tmp)
+
+    def log(self, text):
+        line = now_iso() + " " + str(text).rstrip() + "\n"
+        with open(LOG_FILE, "a", encoding="utf-8", errors="replace") as handle:
+            handle.write(line)
+
+    def git_command(self, repo, args):
+        return ["git", "-c", f"safe.directory={repo}", "-C", repo] + list(args)
+
+    def git_env(self):
+        credentials = git_credentials_status()
+        askpass = GIT_ASKPASS
+        if not credentials.get("configured") or not os.path.isfile(askpass) or not os.access(askpass, os.X_OK):
+            askpass = "/bin/false"
+        env = os.environ.copy()
+        env["DISPLAY"] = env.get("DISPLAY", ":0")
+        env["GIT_TERMINAL_PROMPT"] = "0"
+        env["GIT_ASKPASS_REQUIRE"] = "force"
+        env["SSH_ASKPASS"] = askpass
+        env["GIT_ASKPASS"] = askpass
+        env["_VIDEO_GIT_ASKPASS_USED"] = askpass
+        env["_VIDEO_GIT_ASKPASS_CONFIGURED"] = "1" if credentials.get("configured") else "0"
+        return env
+
+    def run_command(self, phase, message, cmd, timeout=None, env=None):
+        self.write_status("running", phase, message, running=True)
+        self.log("$ " + " ".join(cmd))
+        started = time.time()
+
+        try:
+            proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1,
+                env=env,
+            )
+        except Exception as exc:
+            self.diagnostics = str(exc)
+            self.log("ERROR: " + str(exc))
+            return 1
+
+        try:
+            output, _ = proc.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            output, _ = proc.communicate()
+            for timeout_line in (output or "").splitlines():
+                self.log(timeout_line)
+            self.log(f"TIMEOUT after {timeout}s")
+            self.diagnostics = f"{message}: timeout after {timeout}s"
+            return 124
+
+        rc = proc.returncode
+        output_tail = []
+        for line in (output or "").splitlines():
+            self.log(line)
+            output_tail.append(line)
+            output_tail = output_tail[-25:]
+        self.diagnostics = "\n".join(output_tail)
+        self.log(f"rc={rc}")
+        return rc
+
+    def git_value(self, repo, args):
+        try:
+            proc = subprocess.run(
+                self.git_command(repo, args),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                env=self.git_env(),
+                timeout=12,
+                check=False,
+            )
+            if proc.returncode == 0:
+                return proc.stdout.strip()
+            self.log("git value failed: " + trim(proc.stdout))
+        except Exception as exc:
+            self.log("git value exception: " + str(exc))
+        return ""
+
+    def service_state(self, unit):
+        systemctl = shutil.which("systemctl") or "/bin/systemctl"
+        try:
+            proc = subprocess.run(
+                [systemctl, "is-active", unit],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                timeout=5,
+                check=False,
+            )
+            return proc.stdout.strip() or "unknown"
+        except Exception as exc:
+            return "ERROR: " + str(exc)
+
+    def run(self):
+        open(LOG_FILE, "w", encoding="utf-8").close()
+        os.chmod(LOG_FILE, 0o644)
+        self.write_status("running", "starting", "Preparing update", running=True)
+        self.log("Update job started: " + self.job_id)
+
+        repo_raw = read_file(REPO_ROOT_FILE).strip()
+        if not repo_raw:
+            raise RuntimeError(f"Repository path missing: {REPO_ROOT_FILE}")
+        repo = os.path.realpath(repo_raw)
+        if not os.path.isdir(repo):
+            raise RuntimeError(f"Repository path invalid: {repo}")
+
+        install_script = os.path.join(repo, "deploy", "bookworm", "install.sh")
+        if not os.path.isfile(install_script):
+            raise RuntimeError(f"Install script missing: {install_script}")
+
+        self.old_commit = self.git_value(repo, ["rev-parse", "HEAD"])
+        credentials = git_credentials_status()
+        if not credentials.get("configured"):
+            self.exit_code = 0
+            self.diagnostics = "HTTPS updates require Git credentials. Store them in the WebUI under Settings > Git."
+            disable_update_units_without_credentials(self.log)
+            self.write_status(
+                "blocked",
+                "configuration",
+                "Git credentials missing",
+                running=False,
+                exit_code=0,
+                finished_at=now_iso(),
+            )
+            return 0
+
+        rc = self.run_command("fetching", "Git fetch running", self.git_command(repo, ["fetch", "--quiet", "--prune"]), timeout=120, env=self.git_env())
+        if rc != 0:
+            self.exit_code = rc
+            raise RuntimeError("Git fetch failed")
+
+        rc = self.run_command("pulling", "Git pull running", self.git_command(repo, ["pull", "--ff-only"]), timeout=180, env=self.git_env())
+        if rc != 0:
+            self.exit_code = rc
+            raise RuntimeError("Git pull failed")
+
+        self.new_commit = self.git_value(repo, ["rev-parse", "HEAD"])
+        rc = self.run_command("installing", "Installation running", ["/bin/bash", install_script, "--no-pull"], timeout=900)
+        if rc != 0:
+            self.exit_code = rc
+            raise RuntimeError("Installation failed")
+
+        systemctl = shutil.which("systemctl") or "/bin/systemctl"
+        self.run_command(
+            "verifying",
+            "Update-check timer is being enabled",
+            [systemctl, "enable", "--now", "vdisk-relay-update-check.timer"],
+            timeout=30,
+        )
+
+        self.write_status("running", "verifying", "Checking services", running=True)
+        self.service_checks = {
+            "vdisk-relay-web.service": self.service_state("vdisk-relay-web.service"),
+            "vdisk-relay-status-cache.timer": self.service_state("vdisk-relay-status-cache.timer"),
+            "vdisk-relay-web-status-cache.timer": self.service_state("vdisk-relay-web-status-cache.timer"),
+            "vdisk-relay-update-check.timer": self.service_state("vdisk-relay-update-check.timer"),
+        }
+        self.web_check = self.service_checks.get("vdisk-relay-web.service", "")
+        self.log("service_checks=" + json.dumps(self.service_checks, ensure_ascii=False, sort_keys=True))
+
+        if os.path.isfile(UPDATE_CHECK):
+            self.run_command("verifying", "Updating update check", [UPDATE_CHECK], timeout=120)
+
+        self.exit_code = 0
+        self.write_status("success", "success", "Update completed successfully", running=False, exit_code=0, finished_at=now_iso())
+        self.log("Update job completed successfully")
+        return 0
+
+
+def main():
+    os.makedirs(UPDATE_DIR, mode=0o755, exist_ok=True)
+    lock_fd = os.open(LOCK_FILE, os.O_CREAT | os.O_RDWR, 0o644)
+    try:
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            print("Update already running", file=sys.stderr)
+            return 1
+
+        job = UpdateJob()
+        try:
+            return job.run()
+        except Exception as exc:
+            job.log("ERROR: " + str(exc))
+            if job.exit_code is None:
+                job.exit_code = 1
+            job.write_status(
+                "failed",
+                "failed",
+                str(exc),
+                running=False,
+                exit_code=job.exit_code,
+                finished_at=now_iso(),
+            )
+            return job.exit_code or 1
+    finally:
+        os.close(lock_fd)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

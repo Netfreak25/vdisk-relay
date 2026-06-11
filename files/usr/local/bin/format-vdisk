@@ -1,0 +1,95 @@
+#!/bin/bash
+modprobe -r g_mass_storage
+/usr/local/bin/umount_vdisk
+filepath="/usbdisk.img"
+
+function create_parition () {
+#echo 32768 # 2GB = 2097152 kb / 64 tracks = 32768 cylinders
+#echo 1048576 # 64GB = 67108864 kb / 64 tracks = 1048576 cylinders
+
+(
+echo x # switch to eXpert mode
+echo s # set sectors/track
+echo 8 # g_mass_storage uses a sector size of 512 bytes, so 8 sectors/track will give us 4096 bytes per track
+echo h # set number of heads
+echo 16
+echo c # set number of cylinders
+echo 524288 # 32GB = 33554432 kb / 64 tracks = 524288 cylinders
+echo r # return to normal mode
+echo n # new partition
+echo p # primary
+echo 1
+echo   # accept default
+echo   # accept default
+echo t # new partition is created by default as a Linux partition. Since you want to use the gadget with a Windows host, you should change the partition type to FAT32
+echo b
+echo a # partition should be set as active or USB drive will not be attached to the file-system when plugged in.
+echo p # print new partition table to verify..
+echo w # Write changes
+) | sudo fdisk $filepath
+
+if [ "${?}" == 0 ] ; then
+echo "Partitioning complete completed"
+else
+echo "Partitioning failed"
+echo "Stopping now..."
+exit 1
+fi
+
+
+
+}
+
+function wipe_disk () {
+#dd if=/dev/zero of=$filepath bs=4M count=16384 64gb
+dd if=/dev/zero of=$filepath bs=4M count=8192 status=progress
+
+if [ "${?}" == 0 ] ; then
+echo "Wipe completed"
+else
+echo "Wipe failed"
+echo "Stopping now..."
+exit 1
+fi
+
+
+
+
+}
+
+function format_partition () {
+#/usr/local/bin/mount_vdisk
+losetup -o $((2048*512)) /dev/loop0 /usbdisk.img
+mkfs -t vfat -v /dev/loop0 -n usbdisk
+if [ "${?}" == 0 ] ; then
+echo "Format completed"
+else
+echo "Format failed"
+echo "Stopping now..."
+exit 1
+fi
+losetup -d /dev/loop0
+#/usr/local/bin/umount_vdisk
+
+}
+
+
+echo "Please stop vdisk-watchdog screen manually"
+read -p "Press any key to continue"
+echo "Next Step:"
+echo "Wiping /usbdisk.img"
+read -p "Press any key to continue"
+#wipe_disk
+echo "Next Step:"
+echo "Paritioning /usbdisk.img"
+read -p "Press any key to continue"
+#create_parition
+echo "Next Step:"
+echo "Formating vfat /usbdisk.img"
+read -p "Press any key to continue"
+format_partition
+
+echo
+echo "All done!"
+echo "rebooting now!"
+reboot

@@ -1,0 +1,966 @@
+#!/usr/bin/env python3
+import html
+import json
+import os
+import re
+import shlex
+import socket
+import subprocess
+import time
+from datetime import datetime
+
+RUN_DIR = "/run/vdisk-relay"
+WWW_DIR = "/run/vdisk-relay-www"
+STATUS_JSON = f"{RUN_DIR}/status.json"
+DEBUG_JSON_OUT = f"{WWW_DIR}/debug.json"
+HTML_OUT = f"{WWW_DIR}/debug.html"
+LOG_FILE = "/var/log/vdisk-relay.log"
+CONFIG_FILE = "/etc/vdisk-relay.conf"
+IMAGE_FILE = "/usbdisk.img"
+MOUNTPOINT = "/run/vdisk-relay/mnt"
+
+UNITS = [
+    "vdisk-relay-gadget-live.service",
+    "vdisk-relay-watch-live.path",
+    "vdisk-relay-trigger-live.service",
+    "vdisk-relay-fast-sync.service",
+    "vdisk-relay-ultra-fast-sync.service",
+    "vdisk-relay-sync-live.service",
+    "vdisk-relay-telegram-queue.service",
+    "vdisk-relay-telegram-queue.timer",
+    "vdisk-relay-retry-live.service",
+    "vdisk-relay-retry-live.timer",
+    "vdisk-relay-image-mtime-watch.service",
+    "vdisk-relay-image-mtime-watch.timer",
+    "vdisk-relay-watchdog-live.service",
+    "vdisk-relay-watchdog-live.timer",
+    "vdisk-relay-archive-live.service",
+    "vdisk-relay-archive-live.timer",
+    "vdisk-relay-health-live.service",
+    "vdisk-relay-health-live.timer",
+    "vdisk-relay-boot-notify-live.service",
+    "vdisk-relay-web.service",
+    "vdisk-relay-web-status-cache.service",
+    "vdisk-relay-web-status-cache.timer",
+    "vdisk-relay-debug-cache.service",
+    "vdisk-relay-debug-cache.timer",
+    "vdisk-relay-network-guardian.service",
+    "vdisk-relay-network-guardian.timer",
+    "vdisk-relay-status-cache.service",
+    "vdisk-relay-status-cache.timer",
+    "vdisk-relay-preview-cache.service",
+    "vdisk-relay-preview-cache.timer",
+    "vdisk-relay-update.service",
+    "vdisk-relay-update-check.service",
+    "vdisk-relay-update-check.timer",
+    "vdisk-relay-format-on-boot.service",
+]
+
+UNITS_SET = set(UNITS)
+
+
+def esc(value):
+    if value is None:
+        return ""
+    return html.escape(str(value))
+
+
+def badge(value):
+    if value in [True, "OK", "INFO", "active", "enabled", "call enabled", "0", "off"]:
+        cls = "ok"
+    elif value in [False, "CRIT", "inactive", "disabled", "failed", "on"]:
+        cls = "bad"
+    else:
+        cls = "warn"
+    return f'<span class="badge {cls}">{esc(value)}</span>'
+
+
+def kv_rows(items):
+    out = []
+    for key, value in items:
+        if isinstance(value, bool) or value in [
+            "OK", "INFO", "WARN", "CRIT",
+            "active", "inactive", "enabled", "disabled", "call enabled",
+            "off", "on", "timer enabled"
+        ]:
+            shown = badge(value)
+        else:
+            shown = esc(value)
+        out.append(f"<tr><th>{esc(key)}</th><td>{shown}</td></tr>")
+    return "\n".join(out)
+
+
+def run(cmd, timeout=5):
+    try:
+        p = subprocess.run(
+            ["/usr/bin/timeout", f"{timeout}s", "/bin/bash", "-lc", cmd],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=timeout + 2,
+            check=False,
+        )
+        return p.returncode, p.stdout.strip()
+    except subprocess.TimeoutExpired:
+        return 124, f"TIMEOUT after {timeout}s"
+    except Exception as exc:
+        return 1, f"ERROR: {exc}"
+
+
+def status_component_id(name):
+    value = (name or "").strip().lower()
+    value = value.replace("/", "_")
+    value = re.sub(r"[^a-z0-9]+", "_", value)
+    return value.strip("_") or "unknown"
+
+
+def parse_status_components(text):
+    components = []
+    for line in (text or "").splitlines():
+        match = re.match(r"^(OK|FAIL|WARN|WATCH|CRITICAL)\s+(.+?)(?:\s{2,}|\t+)(.*)$", line.strip())
+        if not match:
+            continue
+        state, name, message = match.groups()
+        name = name.strip()
+        components.append(
+            {
+                "id": status_component_id(name),
+                "name": name,
+                "state": state,
+                "message": message.strip() or "-",
+            }
+        )
+    return components
+
+
+def read_file(path, default=""):
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            return f.read()
+    except FileNotFoundError:
+        return default
+    except Exception as exc:
+        return f"ERROR: {exc}"
+
+
+def load_json(path, default=None):
+    if default is None:
+        default = {}
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as handle:
+            data = json.load(handle)
+        return data
+    except Exception:
+        return default
+
+
+def write_atomic(path, content, mode=0o644):
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(content)
+    os.chmod(tmp, mode)
+    os.replace(tmp, path)
+
+
+def parse_config_value(name, default=""):
+    text = read_file(CONFIG_FILE)
+    for line in text.splitlines():
+        parsed = parse_shell_assignment(line)
+        if not parsed:
+            continue
+        key, value = parsed
+        if key == name:
+            return value
+    return default
+
+
+def parse_shell_assignment(line):
+    stripped = line.strip()
+    if not stripped or stripped.startswith("#") or "=" not in stripped:
+        return None
+
+    key, _value = stripped.split("=", 1)
+    key = key.strip()
+    if not re.match(r"^[A-Z0-9_]+$", key):
+        return None
+
+    try:
+        parts = shlex.split(stripped, comments=True, posix=True)
+    except ValueError:
+        return None
+
+    if len(parts) != 1 or "=" not in parts[0]:
+        return None
+
+    parsed_key, parsed_value = parts[0].split("=", 1)
+    if parsed_key != key:
+        return None
+    return parsed_key, parsed_value
+
+
+def human_size(num):
+    try:
+        num = float(num)
+    except Exception:
+        return ""
+    units = ["B", "KiB", "MiB", "GiB", "TiB"]
+    idx = 0
+    while num >= 1024 and idx < len(units) - 1:
+        num /= 1024
+        idx += 1
+    if idx == 0:
+        return f"{int(num)} {units[idx]}"
+    return f"{num:.1f} {units[idx]}"
+
+
+def file_info(path):
+    try:
+        st = os.stat(path)
+        return {
+            "exists": True,
+            "size": st.st_size,
+            "size_human": human_size(st.st_size),
+            "mtime_epoch": int(st.st_mtime),
+            "mtime": datetime.fromtimestamp(st.st_mtime).astimezone().isoformat(),
+            "age_sec": int(time.time() - st.st_mtime),
+        }
+    except FileNotFoundError:
+        return {"exists": False, "size": 0, "size_human": "", "mtime": "", "age_sec": ""}
+
+
+def df_info(path):
+    rc, out = run(f"df -h {path} 2>/dev/null | awk 'NR==2{{print $2\"|\"$3\"|\"$4\"|\"$5\"|\"$6}}'", 4)
+    if rc != 0 or not out:
+        return None
+    parts = out.split("|")
+    if len(parts) != 5:
+        return None
+    return {
+        "size": parts[0],
+        "used": parts[1],
+        "avail": parts[2],
+        "use_percent": parts[3],
+        "mount": parts[4],
+    }
+
+
+def command_lines(cmd, timeout=4):
+    rc, out = run(cmd, timeout)
+    if not out:
+        return []
+    return out.splitlines()
+
+
+def module_loaded(name, modules_text):
+    return bool(re.search(r"^" + re.escape(name) + r"\s", modules_text, re.M))
+
+
+
+def unit_state(unit):
+    rc, active = run(f"systemctl is-active {unit} 2>/dev/null || true", 3)
+    rc, enabled = run(f"systemctl is-enabled {unit} 2>/dev/null || true", 3)
+
+    active = active.strip() or "unknown"
+    enabled = enabled.strip() or "unknown"
+
+    rc, props = run(
+        "systemctl show "
+        + unit
+        + " -p Result -p ExecMainStatus -p Type --no-pager 2>/dev/null",
+        3,
+    )
+
+    result = ""
+    exec_status = ""
+    unit_type = ""
+
+    for line in props.splitlines():
+        if line.startswith("Result="):
+            result = line.split("=", 1)[1]
+        elif line.startswith("ExecMainStatus="):
+            exec_status = line.split("=", 1)[1]
+        elif line.startswith("Type="):
+            unit_type = line.split("=", 1)[1]
+
+    if active == "inactive" and unit_type == "oneshot" and result in ("success", "") and exec_status in ("0", ""):
+        active_display = "OK"
+    else:
+        active_display = active
+
+    enabled_display = unit_enabled_display(unit, enabled)
+
+    return {
+        "active": active_display,
+        "active_raw": active,
+        "enabled": enabled,
+        "enabled_display": enabled_display,
+        "result": result,
+        "exec_status": exec_status,
+        "type": unit_type,
+    }
+
+
+def unit_enabled_display(unit, enabled):
+    if enabled != "static":
+        return enabled
+    if unit.endswith(".service"):
+        timer_unit = unit[:-8] + ".timer"
+        path_unit = unit[:-6] + ".path"
+        if timer_unit in UNITS_SET and systemctl_is_enabled(timer_unit):
+            return "call enabled"
+        if path_unit in UNITS_SET and systemctl_is_enabled(path_unit):
+            return "call enabled"
+    return "call enabled"
+
+
+def systemctl_is_enabled(unit):
+    rc, value = run(f"systemctl is-enabled {unit} 2>/dev/null || true", 3)
+    return value.strip() == "enabled"
+
+
+def unit_show(unit):
+    props = "Result ExecMainStatus ExecMainExitTimestamp"
+    rc, out = run("systemctl show " + unit + " " + " ".join("-p " + p for p in props) + " --no-pager 2>/dev/null", 4)
+    data = unit_state(unit)
+    for line in out.splitlines():
+        if "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        if value:
+            data[key] = value
+    return data
+
+
+def log_tail():
+    return command_lines(f"tail -n 220 {LOG_FILE} 2>/dev/null || true", 5)
+
+
+def last_match(lines, pattern):
+    rx = re.compile(pattern)
+    for line in reversed(lines):
+        if rx.search(line):
+            return line
+    return ""
+
+
+def timestamp_from_log(line):
+    if not line:
+        return ""
+    m = re.match(r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}[+-]\d{4})", line)
+    if m:
+        return m.group(1)
+    return ""
+
+
+def lock_items():
+    items = []
+    paths = [f"{RUN_DIR}/pending"]
+
+    if os.path.isdir(RUN_DIR):
+        for name in os.listdir(RUN_DIR):
+            if name.endswith(".lock"):
+                paths.append(os.path.join(RUN_DIR, name))
+
+    seen = set()
+    for path in paths:
+        if path in seen:
+            continue
+        seen.add(path)
+
+        if not os.path.exists(path):
+            continue
+
+        info = file_info(path)
+        content = read_file(path)[:500]
+        items.append({
+            "path": path,
+            "age_sec": info.get("age_sec", ""),
+            "content": content,
+        })
+
+    return items
+
+
+def image_loop_info():
+    rc, out = run(f"mountpoint -q {MOUNTPOINT} && echo mounted || echo off", 3)
+    mounted = out.strip() == "mounted"
+
+    loop_devices = []
+    rc, out = run(f"losetup -j {IMAGE_FILE} 2>/dev/null || true", 3)
+    for line in out.splitlines():
+        if ":" in line:
+            loop_devices.append(line.split(":", 1)[0])
+
+    mountpoints = []
+    rc, out = run(f"findmnt -rn -S {IMAGE_FILE} -o TARGET 2>/dev/null || true", 3)
+    mountpoints.extend([line.strip() for line in out.splitlines() if line.strip()])
+
+    if mounted and MOUNTPOINT not in mountpoints:
+        mountpoints.append(MOUNTPOINT)
+
+    return {
+        "mounted": mounted,
+        "loop_devices": loop_devices,
+        "mountpoints": mountpoints,
+    }
+
+
+def network_info():
+    rc, ip_addr = run("hostname -I 2>/dev/null | awk '{print $1}'", 3)
+    rc, gw = run("ip route show default 2>/dev/null | awk '{print $3; exit}'", 3)
+    rc, iface = run("ip route show default 2>/dev/null | awk '{print $5; exit}'", 3)
+
+    gateway_ping_ok = False
+    if gw:
+        rc, out = run(f"ping -c 1 -W 1 {gw} >/dev/null 2>&1", 3)
+        gateway_ping_ok = rc == 0
+
+    rc, out = run("getent hosts api.telegram.org >/dev/null 2>&1", 3)
+    dns_target_ping_ok = rc == 0
+
+    rsync_target = parse_config_value("ARCHIVE_RSYNC_TARGET", "")
+    rsync_host = ""
+    m = re.search(r"@([^:]+)::", rsync_target)
+    if m:
+        rsync_host = m.group(1)
+
+    rsync_host_ping_ok = False
+    if rsync_host:
+        rc, out = run(f"ping -c 1 -W 1 {rsync_host} >/dev/null 2>&1", 3)
+        rsync_host_ping_ok = rc == 0
+
+    wifi = {
+        "essid": "",
+        "bssid": "",
+        "frequency": "",
+        "bit_rate": "",
+        "tx_power": "",
+        "power_management": "",
+        "link_quality": "",
+        "signal_level": "",
+    }
+
+    if iface:
+        rc, iw = run(f"iwconfig {iface} 2>/dev/null || true", 3)
+        patterns = {
+            "essid": r'ESSID:"([^"]*)"',
+            "bssid": r"Access Point:\s*([0-9A-Fa-f:]{17})",
+            "frequency": r"Frequency:([^ ]+)",
+            "bit_rate": r"Bit Rate[=:]([^ ]+ ?[A-Za-z/]+)",
+            "tx_power": r"Tx-Power[=:]([^ \n]+ ?[A-Za-z]*)",
+            "power_management": r"Power Management:([A-Za-z]+)",
+            "link_quality": r"Link Quality=([^ ]+)",
+            "signal_level": r"Signal level=([^ ]+ ?dBm)",
+        }
+
+        for key, pattern in patterns.items():
+            mm = re.search(pattern, iw)
+            if mm:
+                wifi[key] = mm.group(1).strip()
+
+    return {
+        "ip": {
+            "ip_address": ip_addr.strip(),
+            "default_gateway": gw.strip(),
+            "interface": iface.strip(),
+        },
+        "wifi": wifi,
+        "gateway_ping_ok": gateway_ping_ok,
+        "dns_target_ping_ok": dns_target_ping_ok,
+        "rsync_host_ping_ok": rsync_host_ping_ok,
+        "rsync_target_label": rsync_target,
+    }
+
+
+def cached_status_summary():
+    data = load_json(STATUS_JSON, {})
+    if not isinstance(data, dict):
+        data = {}
+    overall = data.get("overall", {})
+    if isinstance(overall, dict):
+        state = str(overall.get("state") or data.get("overall_state") or "FAIL").upper()
+        try:
+            rc = int(overall.get("exitcode", 1))
+        except Exception:
+            rc = 1
+    else:
+        state = str(overall or data.get("overall_state") or "FAIL").upper()
+        rc = 0 if state == "OK" else 2
+    status_lights = str(data.get("status_lights") or "")
+    components = data.get("status_components", [])
+    if not isinstance(components, list):
+        components = parse_status_components(status_lights)
+    return data, state, rc, status_lights, components
+
+
+def build_status():
+    cached_status, cached_overall, status_rc, status_lights, status_components = cached_status_summary()
+    health_rc, health = run("/usr/local/sbin/vdisk-relay health || true", 6)
+    modules_rc, modules = run("lsmod | grep -E 'g_mass_storage|usb_f_mass_storage|dwc2|libcomposite|roles' || true", 4)
+
+    logs = log_tail()
+
+    pending_exists = os.path.exists(f"{RUN_DIR}/pending")
+    gadget_loaded = module_loaded("g_mass_storage", modules)
+    dwc2_loaded = module_loaded("dwc2", modules)
+
+    if pending_exists:
+        current_phase = "PENDING"
+    elif gadget_loaded:
+        current_phase = "IDLE_GADGET_ATTACHED"
+    else:
+        current_phase = "IDLE_GADGET_DETACHED"
+
+    last_event = logs[-1] if logs else ""
+
+    state = {
+        "last_inotify_event": timestamp_from_log(last_match(logs, r"pending state set")),
+        "last_gadget_detach": timestamp_from_log(last_match(logs, r"stoppe g_mass_storage|g_mass_storage gestoppt")),
+        "last_mount_ok": timestamp_from_log(last_match(logs, r"sync start mode_mount=1")),
+        "last_mount_error": timestamp_from_log(last_match(logs, r"mount failed|losetup failed|Refuse to mount")),
+        "last_copy_start": timestamp_from_log(last_match(logs, r"APPLY-RSYNC: writing new files")),
+        "last_copy_ok": timestamp_from_log(last_match(logs, r"sync done")),
+        "last_copy_error": timestamp_from_log(last_match(logs, r"rsync failed")),
+        "last_umount_ok": timestamp_from_log(last_match(logs, r"sync done")),
+        "last_gadget_attach": timestamp_from_log(last_match(logs, r"g_mass_storage started|starting g_mass_storage")),
+        "last_rsync_archive_start": timestamp_from_log(last_match(logs, r"ARCHIVE APPLY")),
+        "last_rsync_archive_ok": "",
+        "last_rsync_archive_exit": "",
+        "last_rsync_target_start": timestamp_from_log(last_match(logs, r"ARCHIVE APPLY")),
+        "last_rsync_target_ok": "",
+        "last_rsync_target_exit": "",
+        "last_telegram_ok": timestamp_from_log(last_match(logs, r"SEND-OK|telegram text send ok|TEST-VIDEO-SEND-OK")),
+        "last_telegram_error": timestamp_from_log(last_match(logs, r"SEND-FAILED|telegram text send failed")),
+        "last_successful_full_cycle": timestamp_from_log(last_match(logs, r"live-sync: successful")),
+        "last_error_time": timestamp_from_log(last_match(logs, r"\[ERROR\]|failed|FAILED")),
+        "last_error": last_match(logs, r"\[ERROR\]|failed|FAILED"),
+        "last_event": last_event,
+        "last_event_time": timestamp_from_log(last_event),
+        "last_copied_files": [],
+        "last_copy_duration_sec": "",
+        "last_rsync_archive_duration_sec": "",
+        "last_rsync_target_duration_sec": "",
+        "full_cycle_duration_sec": "",
+    }
+
+    archive_unit = unit_show("vdisk-relay-archive-live.service")
+    if archive_unit.get("Result") in ("success", "") and archive_unit.get("ExecMainStatus") in ("0", ""):
+        state["last_rsync_archive_ok"] = archive_unit.get("ExecMainExitTimestamp", "")
+        state["last_rsync_target_ok"] = archive_unit.get("ExecMainExitTimestamp", "")
+
+    state["last_rsync_archive_exit"] = archive_unit.get("ExecMainStatus", "")
+    state["last_rsync_target_exit"] = archive_unit.get("ExecMainStatus", "")
+
+    runtime = {
+        "current_phase": current_phase,
+        "phase_since": datetime.now().astimezone().isoformat(),
+        "watchdog_alive": unit_state("vdisk-relay-watch-live.path")["active"] == "active",
+        "g_mass_storage_loaded": gadget_loaded,
+        "dwc2_loaded": dwc2_loaded,
+        "image_loop": image_loop_info(),
+        "locks": lock_items(),
+        "watchdog_processes": command_lines("ps -eo pid,ppid,stat,etime,cmd | grep -E 'vdisk-relay|g_mass_storage|rsync' | grep -v grep || true", 4),
+    }
+
+    network = network_info()
+    image = file_info(IMAGE_FILE)
+
+    storage = {
+        "root": df_info("/"),
+        "boot_firmware": df_info("/boot/firmware") or df_info("/boot"),
+        "archive_path": {"avail": "rsync-daemon"},
+    }
+
+    units = {unit: unit_state(unit) for unit in UNITS}
+
+    problems = []
+    notes = []
+
+    if status_rc != 0:
+        problems.append("cached status reports non-green overall status")
+    if not gadget_loaded:
+        problems.append("g_mass_storage is not loaded")
+    if runtime["image_loop"]["mounted"]:
+        problems.append("image is mounted locally")
+    if runtime["image_loop"]["loop_devices"]:
+        problems.append("Loopdevice auf /usbdisk.img active")
+    if pending_exists:
+        problems.append("Pending-State ist available")
+    if not network["dns_target_ping_ok"]:
+        problems.append("DNS for api.telegram.org is unavailable")
+    if state["last_error"]:
+        problems.append("Last error im Log available")
+
+    notes.append("Archiving runs via rsync daemon, not via NFS mount.")
+    notes.append("Debug page is generated from cache and runs no live commands during the request.")
+
+    return {
+        "overall": "OK" if status_rc == 0 and not problems else ("WARN" if problems else "OK"),
+        "generated_at": datetime.now().astimezone().isoformat(),
+        "status_generated_at": cached_status.get("generated_at", "") if isinstance(cached_status, dict) else "",
+        "status_lights": status_lights,
+        "status_components": status_components,
+        "state": state,
+        "runtime": runtime,
+        "network": network,
+        "image": image,
+        "storage": storage,
+        "units": units,
+        "logs": {
+            "vdisk-relay.log": "\n".join(logs[-160:]),
+        },
+        "problems": problems,
+        "notes": notes,
+        "raw": {
+            "status_lights": status_lights,
+            "health": health,
+            "modules": modules,
+        },
+    }
+
+
+def render_html(status):
+    state = status["state"]
+    runtime = status["runtime"]
+    network = status["network"]
+    wifi = network["wifi"]
+    ip = network["ip"]
+    image = status["image"]
+    storage = status["storage"]
+
+    timeline_keys = [
+        "last_inotify_event",
+        "last_gadget_detach",
+        "last_mount_ok",
+        "last_mount_error",
+        "last_copy_start",
+        "last_copy_ok",
+        "last_copy_error",
+        "last_umount_ok",
+        "last_gadget_attach",
+        "last_rsync_archive_start",
+        "last_rsync_archive_ok",
+        "last_rsync_archive_exit",
+        "last_rsync_target_start",
+        "last_rsync_target_ok",
+        "last_rsync_target_exit",
+        "last_telegram_ok",
+        "last_telegram_error",
+        "last_successful_full_cycle",
+        "last_error_time",
+        "last_error",
+    ]
+
+    timeline_rows = []
+    for key in timeline_keys:
+        if key in state:
+            msg = state.get(key + "_message", "")
+            timeline_rows.append(
+                f"<tr><th>{esc(key)}</th><td>{esc(state.get(key))}</td><td>{esc(msg)}</td></tr>"
+            )
+
+    log_blocks = []
+    for name, text in sorted(status["logs"].items()):
+        log_blocks.append(
+            f"<details><summary>{esc(name)}</summary><pre>{esc(text)}</pre></details>"
+        )
+
+    copied_files = state.get("last_copied_files", [])
+    if isinstance(copied_files, list):
+        copied_files_html = "".join(f"<li>{esc(item)}</li>" for item in copied_files)
+    else:
+        copied_files_html = ""
+
+    problems_html = "<p>No detected problems in cache.</p>"
+    if status["problems"]:
+        problems_html = (
+            "<ul>"
+            + "".join(f"<li>{esc(item)}</li>" for item in status["problems"])
+            + "</ul>"
+        )
+
+    notes_html = "<p>No notes.</p>"
+    if status["notes"]:
+        notes_html = (
+            "<ul>"
+            + "".join(f"<li>{esc(item)}</li>" for item in status["notes"])
+            + "</ul>"
+        )
+
+    systemd_rows = []
+    for unit, values in status["units"].items():
+        systemd_rows.append(
+            "<tr><th>"
+            + esc(unit)
+            + "</th><td>"
+            + badge(values.get("active"))
+            + "</td><td>"
+            + badge(values.get("enabled_display", values.get("enabled")))
+            + "</td></tr>"
+        )
+
+    lock_rows = []
+    for item in runtime["locks"]:
+        lock_rows.append(
+            "<tr><td>"
+            + esc(item["path"])
+            + "</td><td>"
+            + esc(item["age_sec"])
+            + "</td><td>"
+            + esc(item["content"])
+            + "</td></tr>"
+        )
+
+    return f"""<!doctype html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta http-equiv="refresh" content="300">
+<title>VDisk Relay State</title>
+<style>
+body {{
+  font-family: system-ui, -apple-system, Segoe UI, sans-serif;
+  background: #111827;
+  color: #e5e7eb;
+  margin: 0;
+  padding: 20px;
+}}
+
+h1, h2, h3 {{
+  margin: 0 0 12px;
+}}
+
+h2 {{
+  margin-top: 28px;
+  border-bottom: 1px solid #374151;
+  padding-bottom: 6px;
+}}
+
+.grid {{
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+  gap: 14px;
+}}
+
+.card {{
+  background: #1f2937;
+  border: 1px solid #374151;
+  border-radius: 10px;
+  padding: 14px;
+}}
+
+table {{
+  width: 100%;
+  border-collapse: collapse;
+  background: #1f2937;
+  border-radius: 10px;
+  overflow: hidden;
+}}
+
+th, td {{
+  text-align: left;
+  border-bottom: 1px solid #374151;
+  padding: 7px 9px;
+  vertical-align: top;
+}}
+
+th {{
+  width: 270px;
+  color: #67c1ff;
+  font-weight: 700;
+}}
+
+.badge {{
+  display: inline-block;
+  border-radius: 999px;
+  padding: 2px 9px;
+  font-weight: 700;
+  font-size: .9em;
+}}
+
+.ok {{
+  background: #064e3b;
+  color: #a7f3d0;
+}}
+
+.warn {{
+  background: #78350f;
+  color: #fde68a;
+}}
+
+.bad, .crit {{
+  background: #7f1d1d;
+  color: #fecaca;
+}}
+
+pre {{
+  white-space: pre-wrap;
+  background: #020617;
+  border: 1px solid #374151;
+  border-radius: 8px;
+  padding: 10px;
+  max-height: 340px;
+  overflow: auto;
+}}
+
+details {{
+  background: #1f2937;
+  border: 1px solid #374151;
+  border-radius: 10px;
+  margin: 10px 0;
+  padding: 10px;
+}}
+
+summary {{
+  cursor: pointer;
+  color: #93c5fd;
+  font-weight: 700;
+}}
+
+.small {{
+  color: #9ca3af;
+  font-size: .92em;
+}}
+
+a {{
+  color: #93c5fd;
+}}
+
+ul {{
+  margin-top: 6px;
+}}
+</style>
+</head>
+<body>
+
+<p><a href="/">back to overview</a> · <a href="/details">Details</a></p>
+
+<h1>VDisk Relay State {badge(status["overall"])}</h1>
+<p class="small">
+  Generated: {esc(status["generated_at"])}
+  · Cache refresh: 10 minutes
+  · Page reads no live logs.
+</p>
+
+<div class="grid">
+  <div class="card">
+    <h2>Overview</h2>
+    <table>{kv_rows([
+        ("Phase", runtime.get("current_phase")),
+        ("Phase seit", runtime.get("phase_since")),
+        ("Latest full cycle", state.get("last_successful_full_cycle", "")),
+        ("Last error", state.get("last_error", "")),
+        ("Letztes Event", state.get("last_event", "")),
+        ("Latest event time", state.get("last_event_time", "")),
+    ])}</table>
+  </div>
+
+  <div class="card">
+    <h2>Runtime</h2>
+    <table>{kv_rows([
+        ("Watchdog active", runtime["watchdog_alive"]),
+        ("g_mass_storage loaded", runtime["g_mass_storage_loaded"]),
+        ("dwc2 loaded", runtime["dwc2_loaded"]),
+        ("Image gemountet", runtime["image_loop"]["mounted"]),
+        ("Loop Devices", ", ".join(runtime["image_loop"]["loop_devices"])),
+        ("Mountpoints", ", ".join(runtime["image_loop"]["mountpoints"])),
+    ])}</table>
+  </div>
+
+  <div class="card">
+    <h2>Netzwerk</h2>
+    <table>{kv_rows([
+        ("IP", ip.get("ip_address")),
+        ("Gateway", ip.get("default_gateway")),
+        ("Gateway Ping", network.get("gateway_ping_ok")),
+        ("DNS target ping", network.get("dns_target_ping_ok")),
+        ("Rsync-Host Ping", network.get("rsync_host_ping_ok")),
+        ("SSID", wifi.get("essid")),
+        ("BSSID", wifi.get("bssid")),
+        ("Frequenz", wifi.get("frequency")),
+        ("Bitrate", wifi.get("bit_rate")),
+        ("Tx-Power", wifi.get("tx_power")),
+        ("Power Save", wifi.get("power_management")),
+        ("Link Quality", wifi.get("link_quality")),
+        ("Signal", wifi.get("signal_level")),
+    ])}</table>
+  </div>
+</div>
+
+<h2>Probleme</h2>
+<div class="card">{problems_html}</div>
+
+<h2>Hinweise</h2>
+<div class="card">{notes_html}</div>
+
+<h2>Timeline</h2>
+<table>
+<tr><th>Field</th><th>Value</th><th>Message</th></tr>
+{''.join(timeline_rows)}
+</table>
+
+<h2>Transfers</h2>
+<table>{kv_rows([
+    ("rsync destination", network.get("rsync_target_label")),
+    ("Rsync Archive Exit", state.get("last_rsync_archive_exit", "")),
+    ("rsync destination exit", state.get("last_rsync_target_exit", "")),
+    ("Copy Dauer s", state.get("last_copy_duration_sec", "")),
+    ("Rsync Archive Dauer s", state.get("last_rsync_archive_duration_sec", "")),
+    ("rsync destination duration s", state.get("last_rsync_target_duration_sec", "")),
+    ("Vollzyklus Dauer s", state.get("full_cycle_duration_sec", "")),
+])}</table>
+
+<div class="card">
+  <h3>Last copied files</h3>
+  <ul>{copied_files_html}</ul>
+</div>
+
+<h2>Storage</h2>
+<table>{kv_rows([
+    ("Image available", image.get("exists")),
+    ("Image size", image.get("size_human", "")),
+    ("Image mtime", image.get("mtime", "")),
+    ("/ frei", storage["root"].get("avail") if storage["root"] else ""),
+    ("/boot/firmware frei", storage["boot_firmware"].get("avail") if storage["boot_firmware"] else ""),
+    ("Archivpfad frei", storage["archive_path"].get("avail") if storage["archive_path"] else ""),
+])}</table>
+
+<h2>Systemd</h2>
+<table>
+<tr><th>Unit</th><th>Active</th><th>Enabled</th></tr>
+{''.join(systemd_rows)}
+</table>
+
+<h2>Locks</h2>
+<table>
+<tr><th>Path</th><th>Age s</th><th>Content</th></tr>
+{''.join(lock_rows)}
+</table>
+
+<h2>Watchdog processes</h2>
+<pre>{esc(chr(10).join(runtime["watchdog_processes"]))}</pre>
+
+<h2>Short log excerpts</h2>
+{''.join(log_blocks) if log_blocks else '<p>No logs found under /var/log/vdisk-relay/*.log.</p>'}
+
+<h2>Raw JSON</h2>
+<p><a href="/status.json">status.json</a></p>
+
+</body>
+</html>
+"""
+
+
+def main():
+    os.makedirs(RUN_DIR, mode=0o755, exist_ok=True)
+    os.makedirs(WWW_DIR, mode=0o755, exist_ok=True)
+
+    status = build_status()
+
+    write_atomic(DEBUG_JSON_OUT, json.dumps(status, ensure_ascii=False, indent=2) + "\n", 0o644)
+    write_atomic(HTML_OUT, render_html(status), 0o644)
+
+
+if __name__ == "__main__":
+    main()

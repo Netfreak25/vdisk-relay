@@ -1,0 +1,117 @@
+#!/bin/bash
+set -u
+
+if [ "${1:-}" = "--once" ]; then
+  echo "=== $(date '+%F %T%z') ==="
+
+  echo
+  echo "=== preview config ==="
+  grep -nE '^PREVIEW_' /etc/vdisk-relay.conf 2>/dev/null || true
+
+  echo
+  echo "=== service ==="
+  systemctl status vdisk-relay-preview-cache.service --no-pager -l 2>/dev/null | sed -n '1,16p'
+
+  echo
+  echo "=== timer ==="
+  systemctl list-timers --all 2>/dev/null | grep vdisk-relay-preview-cache || true
+
+  echo
+  echo "=== prozesse ==="
+  ps -eo pid,ppid,stat,ni,etime,pcpu,pmem,cmd \
+    | grep -E 'vdisk-relay-preview-cache|ffmpeg' \
+    | grep -v grep || echo "[OK] no preview/ffmpeg process"
+
+  echo
+  echo "=== fortschritt ==="
+  printf "jpg files: "
+  find /var/cache/vdisk-relay-previews -maxdepth 1 -type f -name '*.jpg' 2>/dev/null | wc -l
+
+  printf "Index entries: "
+  python3 - <<'PY'
+import json, os
+p="/var/cache/vdisk-relay-previews/index.json"
+try:
+    print(len(json.load(open(p)))) if os.path.exists(p) else print(0)
+except Exception:
+    print(0)
+PY
+
+  printf "Backlog-Eintraege: "
+  python3 - <<'PY'
+import json, os
+p="/var/cache/vdisk-relay-previews/backlog.json"
+try:
+    print(len(json.load(open(p)))) if os.path.exists(p) else print(0)
+except Exception:
+    print(0)
+PY
+
+  printf "Backlog ignoriert: "
+  python3 - <<'PY'
+import json, os
+p="/var/cache/vdisk-relay-previews/backlog.json"
+try:
+    data=json.load(open(p)) if os.path.exists(p) else {}
+    print(sum(1 for v in data.values() if isinstance(v, dict) and v.get("ignored")))
+except Exception:
+    print(0)
+PY
+
+  echo
+  echo "=== letzte previews ==="
+  find /var/cache/vdisk-relay-previews -maxdepth 1 -type f -name '*.jpg' \
+    -printf '%TY-%Tm-%Td %TH:%TM %s %f\n' 2>/dev/null \
+    | sort \
+    | tail -n 8
+
+  echo
+  echo "=== latest backlog ==="
+  python3 - <<'PY'
+import json, os
+p="/var/cache/vdisk-relay-previews/backlog.json"
+if not os.path.exists(p):
+    print("[OK] no backlog.json")
+    raise SystemExit
+try:
+    d=json.load(open(p))
+except Exception as e:
+    print("ERROR:", e)
+    raise SystemExit
+items=[(rel, v) for rel, v in d.items() if isinstance(v, dict)]
+ignored=sum(1 for _, v in items if v.get("ignored"))
+retry=len(items)-ignored
+print("count=", len(items), "retry=", retry, "ignored=", ignored)
+items.sort(key=lambda item: str(item[1].get("last_failure_at", "")), reverse=True)
+for rel, v in items[:8]:
+    stderr=str(v.get("last_stderr", "")).replace("\n", " ")[:120]
+    print(
+        rel,
+        "fail_count=", v.get("fail_count"),
+        "long_fail_count=", v.get("long_fail_count"),
+        "ignored=", v.get("ignored"),
+        "mode=", v.get("last_mode"),
+        "rc=", v.get("last_rc"),
+        "stderr=", stderr,
+    )
+PY
+
+  echo
+  echo "=== letzte logs ==="
+  journalctl -u vdisk-relay-preview-cache.service -n 12 --no-pager 2>/dev/null || true
+
+  exit 0
+fi
+
+INTERVAL="${1:-20}"
+case "$INTERVAL" in
+  ''|*[!0-9]*) INTERVAL=20 ;;
+esac
+
+command -v watch >/dev/null 2>&1 || {
+  echo "[ERROR] watch missing. Package: procps"
+  exit 1
+}
+
+SELF="$(readlink -f "$0")"
+exec watch -n "$INTERVAL" "$SELF --once"

@@ -1,0 +1,15 @@
+OK    Gates                  all live gates present
+OK    USB-Gadget             g_mass_storage loaded
+OK    Watch/Trigger          path trigger active
+OK    Live-Sync              no local mount/loop, service not failed
+OK    Retry                  timer active, fast sync path
+OK    Fast-Path              fast active, delay=3s, quiet=3s
+OK    MTime-Fallback         lightweight image mtime check active
+OK    Watchdog-Timer         timer active, gadget/image separated from delivery path
+OK    Data/Health            OK newest_file="/files/example.mp4" source_id=source1 source=latest-scan age_seconds=62330 max_seconds=100800
+OK    Telegram-File          configuration for active sources present
+OK    Telegram-Queue         timer active, pending=0, failed=0
+OK    Boot notify            enabled, not failed, Telegram config present
+OK    Archive                timer active, rsync-daemon target configured
+OK    Health-Timer           timer active
+OK    Overall                all base functions green

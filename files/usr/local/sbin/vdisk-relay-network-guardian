@@ -1,0 +1,1082 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""Lightweight Wi-Fi guardian for VDisk Relay.
+
+Phase 3 adds the NetworkManager-managed emergency AP cycle. The script still
+does not implement captive portal routing, WebUI lockdown, heartbeat handling
+endpoints or reboot escalation; those remain separate later phases.
+"""
+
+import json
+import os
+import shlex
+import shutil
+import socket
+import subprocess
+import tempfile
+import time
+from datetime import datetime, timedelta, timezone
+
+CONFIG_FILE = os.environ.get("VDISK_RELAY_CONFIG", "/etc/vdisk-relay.conf")
+STATE_FILE = os.environ.get(
+    "VDISK_RELAY_NETWORK_GUARDIAN_STATE",
+    "/var/lib/vdisk-relay/network-guardian.json",
+)
+ALLOW_FILE = os.environ.get(
+    "VDISK_RELAY_NETWORK_GUARDIAN_ALLOW_FILE",
+    "/etc/vdisk-relay.allow-network-guardian",
+)
+WIFI_IFACE = os.environ.get("VDISK_RELAY_WIFI_IFACE", "wlan0")
+AP_CONNECTION_NAME = os.environ.get(
+    "VDISK_RELAY_NETWORK_GUARDIAN_AP_CONNECTION",
+    "vdisk-relay-emergency-ap",
+)
+UI_ACTIVITY_FILE = os.environ.get(
+    "VDISK_RELAY_EMERGENCY_UI_ACTIVITY",
+    "/run/vdisk-relay/emergency-ui-active.json",
+)
+DNS_PROBE_HOST = os.environ.get(
+    "VDISK_RELAY_NETWORK_GUARDIAN_DNS_PROBE",
+    "example.com",
+)
+
+COMMAND_TIMEOUT_SECONDS = 8
+DNS_TIMEOUT_SECONDS = 5
+GATEWAY_TIMEOUT_SECONDS = 4
+RECONNECT_TIMEOUT_SECONDS = 45
+AP_START_TIMEOUT_SECONDS = 50
+AP_STOP_TIMEOUT_SECONDS = 30
+MAX_RECONNECT_WAIT_SECONDS = 180
+MAX_RECOVERY_WAIT_SECONDS = 180
+MIN_AP_PASSWORD_LENGTH = 8
+MAX_AP_PASSWORD_LENGTH = 63
+
+CONFIG_DEFAULTS = {
+    "NETWORK_GUARDIAN_ENABLED": "1",
+    "NETWORK_GUARDIAN_CHECK_INTERVAL_SECONDS": "300",
+    "NETWORK_GUARDIAN_FAILS_BEFORE_AP": "3",
+    "NETWORK_GUARDIAN_RECONNECT_WAIT_SECONDS": "90",
+    "NETWORK_GUARDIAN_AP_MIN_SECONDS": "600",
+    "NETWORK_GUARDIAN_UI_ACTIVE_GRACE_SECONDS": "120",
+    "NETWORK_GUARDIAN_RECOVERY_WAIT_SECONDS": "90",
+    "NETWORK_GUARDIAN_AP_SSID_PREFIX": "VDiskRelay-Setup",
+    "NETWORK_GUARDIAN_AP_PASSWORD": "",
+    "NETWORK_GUARDIAN_AP_IPV4": "10.254.77.1/24",
+}
+
+
+def now_local():
+    return datetime.now(timezone.utc).astimezone()
+
+
+def iso_now():
+    return now_local().isoformat(timespec="seconds")
+
+
+def iso_after(seconds):
+    return (now_local() + timedelta(seconds=seconds)).isoformat(timespec="seconds")
+
+
+def iso_datetime(value):
+    return value.astimezone().isoformat(timespec="seconds")
+
+
+def parse_iso_datetime(value):
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(value))
+    except (TypeError, ValueError):
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=now_local().tzinfo)
+    return parsed
+
+
+def seconds_since(value):
+    parsed = parse_iso_datetime(value)
+    if parsed is None:
+        return None
+    return max(0, int((now_local() - parsed).total_seconds()))
+
+
+def iso_from_existing_or_now(value):
+    return value if parse_iso_datetime(value) else iso_now()
+
+
+def clamp_int(value, default, minimum=None, maximum=None):
+    try:
+        parsed = int(str(value).strip())
+    except (TypeError, ValueError):
+        parsed = default
+    if minimum is not None:
+        parsed = max(minimum, parsed)
+    if maximum is not None:
+        parsed = min(maximum, parsed)
+    return parsed
+
+
+def truthy(value):
+    return str(value).strip().lower() in {"1", "true", "yes", "on", "ja"}
+
+
+def trim(value, limit=800):
+    text = str(value or "").strip()
+    if len(text) <= limit:
+        return text
+    return text[: limit - 3] + "..."
+
+
+def compact_identifier(value, default, limit=18):
+    text = str(value or "").strip() or default
+    cleaned = []
+    for char in text:
+        if char.isalnum() or char in "-_":
+            cleaned.append(char)
+    result = "".join(cleaned).strip("-_") or default
+    return result[:limit]
+
+
+def hostname_suffix():
+    name = compact_identifier(socket.gethostname(), "pi", limit=16)
+    return name.lower()
+
+
+def parse_shell_value(value):
+    try:
+        parts = shlex.split(value, comments=False, posix=True)
+    except ValueError:
+        return value.strip().strip("\"'")
+    if not parts:
+        return ""
+    return parts[0]
+
+
+def read_config():
+    values = dict(CONFIG_DEFAULTS)
+    try:
+        with open(CONFIG_FILE, "r", encoding="utf-8") as handle:
+            lines = handle.readlines()
+    except OSError:
+        return values
+
+    for raw in lines:
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        if key in values:
+            values[key] = parse_shell_value(value.strip())
+    return values
+
+
+def load_state():
+    try:
+        with open(STATE_FILE, "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def write_state(state):
+    directory = os.path.dirname(STATE_FILE) or "."
+    os.makedirs(directory, mode=0o755, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=".network-guardian.", suffix=".tmp", dir=directory)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(state, handle, ensure_ascii=False, indent=2, sort_keys=True)
+            handle.write("\n")
+        os.chmod(tmp, 0o644)
+        os.replace(tmp, STATE_FILE)
+    finally:
+        try:
+            if os.path.exists(tmp):
+                os.unlink(tmp)
+        except OSError:
+            pass
+
+
+def command_env():
+    env = os.environ.copy()
+    env["LANG"] = "C"
+    env["LC_ALL"] = "C"
+    return env
+
+
+def run_command(args, timeout=COMMAND_TIMEOUT_SECONDS):
+    try:
+        result = subprocess.run(
+            args,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            errors="replace",
+            timeout=timeout,
+            env=command_env(),
+            check=False,
+        )
+        return {"rc": result.returncode, "out": trim(result.stdout)}
+    except FileNotFoundError:
+        return {"rc": 127, "out": args[0] + " missing"}
+    except subprocess.TimeoutExpired as exc:
+        return {"rc": 124, "out": trim(exc.stdout or "") or "Timeout"}
+
+
+def binary(name):
+    return shutil.which(name)
+
+
+def nmcli(args, timeout=COMMAND_TIMEOUT_SECONDS):
+    path = binary("nmcli")
+    if not path:
+        return {"rc": 127, "out": "nmcli missing"}
+    return run_command([path] + args, timeout=timeout)
+
+
+def split_nmcli_line(line):
+    parts = []
+    current = []
+    escaped = False
+    for char in line:
+        if escaped:
+            current.append(char)
+            escaped = False
+        elif char == "\\":
+            escaped = True
+        elif char == ":":
+            parts.append("".join(current))
+            current = []
+        else:
+            current.append(char)
+    parts.append("".join(current))
+    return parts
+
+
+def parse_nmcli_key_values(output):
+    values = {}
+    multi = {}
+    for line in output.splitlines():
+        if ":" not in line:
+            continue
+        key, value = split_nmcli_line(line)[0:2]
+        key = key.strip()
+        value = value.strip()
+        values[key] = value
+        base_key = key.split("[", 1)[0]
+        multi.setdefault(base_key, []).append(value)
+    return values, multi
+
+
+def systemctl_networkmanager_active():
+    path = binary("systemctl")
+    if not path:
+        return True, "systemctl unavailable"
+    result = run_command([path, "is-active", "NetworkManager.service"], timeout=5)
+    if result["rc"] == 0:
+        return True, "NetworkManager active"
+    return False, result["out"] or "NetworkManager not active"
+
+
+def ap_settings(config):
+    prefix = compact_identifier(
+        config.get("NETWORK_GUARDIAN_AP_SSID_PREFIX"),
+        "VDiskRelay-Setup",
+        limit=22,
+    )
+    ssid = (prefix + "-" + hostname_suffix())[:32]
+    password = str(config.get("NETWORK_GUARDIAN_AP_PASSWORD", "") or "").strip()
+    ipv4 = str(config.get("NETWORK_GUARDIAN_AP_IPV4", "10.254.77.1/24") or "").strip()
+    return {
+        "connection": AP_CONNECTION_NAME,
+        "ssid": ssid,
+        "password": password,
+        "ipv4": ipv4 or "10.254.77.1/24",
+    }
+
+
+def ap_public_settings(settings):
+    return {
+        "connection": settings.get("connection", AP_CONNECTION_NAME),
+        "ssid": settings.get("ssid", ""),
+        "ipv4": settings.get("ipv4", ""),
+        "password_set": bool(settings.get("password", "")),
+    }
+
+
+def validate_ap_settings(settings):
+    password = settings.get("password", "")
+    if not password:
+        return False, "AP password missing"
+    if not (MIN_AP_PASSWORD_LENGTH <= len(password) <= MAX_AP_PASSWORD_LENGTH):
+        return False, "AP password must be 8 to 63 characters long"
+    if "/" not in settings.get("ipv4", ""):
+        return False, "AP IPv4 must use CIDR notation"
+    return True, ""
+
+
+def ap_capability():
+    result = nmcli(["-t", "-f", "WIFI-PROPERTIES.AP", "device", "show", WIFI_IFACE])
+    if result["rc"] != 0:
+        return False, {"rc": result["rc"], "out": result["out"], "ap": "unknown"}
+    values, _multi = parse_nmcli_key_values(result["out"])
+    flag = str(values.get("WIFI-PROPERTIES.AP", "") or "").strip().lower()
+    capable = flag in {"yes", "ja", "true", "1"}
+    return capable, {"rc": result["rc"], "out": result["out"], "ap": flag or "unknown"}
+
+
+def connection_exists(name):
+    result = nmcli(["-t", "-f", "NAME", "connection", "show"])
+    if result["rc"] != 0:
+        return False, result
+    for line in result["out"].splitlines():
+        if split_nmcli_line(line)[0] == name:
+            return True, result
+    return False, result
+
+
+def ensure_ap_profile(config):
+    settings = ap_settings(config)
+    public = ap_public_settings(settings)
+    valid, reason = validate_ap_settings(settings)
+    if not valid:
+        return {"ok": False, "reason": reason, "settings": public}
+
+    capable, capability = ap_capability()
+    public["capability"] = capability
+    if not capable:
+        return {"ok": False, "reason": "NetworkManager reports no AP capability", "settings": public}
+
+    exists, exists_result = connection_exists(AP_CONNECTION_NAME)
+    public["connection_exists"] = exists
+    public["connection_query_rc"] = exists_result["rc"]
+
+    if not exists:
+        add = nmcli(
+            [
+                "connection",
+                "add",
+                "type",
+                "wifi",
+                "ifname",
+                WIFI_IFACE,
+                "con-name",
+                AP_CONNECTION_NAME,
+                "ssid",
+                settings["ssid"],
+            ],
+            timeout=AP_START_TIMEOUT_SECONDS,
+        )
+        public["add_rc"] = add["rc"]
+        public["add_out"] = trim(add["out"], 500)
+        if add["rc"] != 0:
+            return {"ok": False, "reason": "AP profile could not be created", "settings": public}
+
+    modify = nmcli(
+        [
+            "connection",
+            "modify",
+            AP_CONNECTION_NAME,
+            "connection.autoconnect",
+            "no",
+            "802-11-wireless.mode",
+            "ap",
+            "802-11-wireless.ssid",
+            settings["ssid"],
+            "802-11-wireless.band",
+            "bg",
+            "ipv4.method",
+            "shared",
+            "ipv4.addresses",
+            settings["ipv4"],
+            "ipv6.method",
+            "disabled",
+            "wifi-sec.key-mgmt",
+            "wpa-psk",
+            "wifi-sec.psk",
+            settings["password"],
+        ],
+        timeout=AP_START_TIMEOUT_SECONDS,
+    )
+    public["modify_rc"] = modify["rc"]
+    public["modify_out"] = trim(modify["out"], 500)
+    if modify["rc"] != 0:
+        return {"ok": False, "reason": "AP profile could not be updated", "settings": public}
+
+    return {"ok": True, "reason": "AP profile ready", "settings": public}
+
+
+def ap_is_active():
+    result = nmcli(["-t", "-f", "NAME,TYPE,DEVICE", "connection", "show", "--active"])
+    info = {"rc": result["rc"], "out": trim(result["out"], 500), "active": False}
+    if result["rc"] != 0:
+        return False, info
+    for line in result["out"].splitlines():
+        parts = split_nmcli_line(line) + ["", "", ""]
+        if parts[0] == AP_CONNECTION_NAME and parts[2] == WIFI_IFACE:
+            info["active"] = True
+            return True, info
+    return False, info
+
+
+def start_emergency_ap(config):
+    prepared = ensure_ap_profile(config)
+    if not prepared["ok"]:
+        return {"ok": False, "reason": prepared["reason"], "ap": prepared.get("settings", {})}
+
+    up = nmcli(
+        ["connection", "up", "id", AP_CONNECTION_NAME, "ifname", WIFI_IFACE],
+        timeout=AP_START_TIMEOUT_SECONDS,
+    )
+    active, active_info = ap_is_active()
+    ap_info = prepared.get("settings", {})
+    ap_info.update(
+        {
+            "up_rc": up["rc"],
+            "up_out": trim(up["out"], 500),
+            "active_check": active_info,
+        }
+    )
+    if up["rc"] != 0 or not active:
+        return {"ok": False, "reason": "AP could not be started", "ap": ap_info}
+    return {"ok": True, "reason": "Emergency AP active", "ap": ap_info}
+
+
+def stop_emergency_ap():
+    active, active_info = ap_is_active()
+    if not active:
+        return {"ok": True, "reason": "Emergency AP was not active", "active_check": active_info}
+    down = nmcli(["connection", "down", "id", AP_CONNECTION_NAME], timeout=AP_STOP_TIMEOUT_SECONDS)
+    return {
+        "ok": down["rc"] == 0,
+        "reason": "Emergency AP stopped" if down["rc"] == 0 else "Emergency AP could not be stopped",
+        "rc": down["rc"],
+        "out": trim(down["out"], 500),
+        "active_check": active_info,
+    }
+
+
+def dns_resolves(host):
+    getent = binary("getent")
+    if getent:
+        result = run_command([getent, "hosts", host], timeout=DNS_TIMEOUT_SECONDS)
+        return result["rc"] == 0, result["out"]
+
+    previous_timeout = socket.getdefaulttimeout()
+    socket.setdefaulttimeout(DNS_TIMEOUT_SECONDS)
+    try:
+        socket.getaddrinfo(host, None)
+        return True, "Python DNS ok"
+    except OSError as exc:
+        return False, str(exc)
+    finally:
+        socket.setdefaulttimeout(previous_timeout)
+
+
+def local_failure(reason, details):
+    return {
+        "ok": False,
+        "failure_class": "local-network-down",
+        "failure_reason": reason,
+        "details": details,
+    }
+
+
+def check_network():
+    details = {
+        "iface": WIFI_IFACE,
+        "dns_probe_host": DNS_PROBE_HOST,
+    }
+
+    if not binary("nmcli"):
+        return {
+            "ok": False,
+            "failure_class": "networkmanager-missing",
+            "failure_reason": "nmcli missing",
+            "details": details,
+        }
+
+    nm_active, nm_reason = systemctl_networkmanager_active()
+    details["networkmanager"] = nm_reason
+    if not nm_active:
+        return {
+            "ok": False,
+            "failure_class": "networkmanager-missing",
+            "failure_reason": "NetworkManager is not active",
+            "details": details,
+        }
+
+    status = nmcli(["-t", "-f", "DEVICE,TYPE,STATE,CONNECTION", "device", "status"])
+    details["device_status_rc"] = status["rc"]
+    if status["rc"] != 0:
+        return {
+            "ok": False,
+            "failure_class": "networkmanager-missing",
+            "failure_reason": "NetworkManager state not readable: " + status["out"],
+            "details": details,
+        }
+
+    device_row = None
+    for line in status["out"].splitlines():
+        parts = split_nmcli_line(line)
+        if parts and parts[0] == WIFI_IFACE:
+            device_row = parts + ["", "", ""]
+            break
+
+    if not device_row:
+        return local_failure("Wi-Fi device " + WIFI_IFACE + " not found", details)
+
+    device_type = device_row[1]
+    device_state = device_row[2]
+    active_connection = device_row[3]
+    details.update(
+        {
+            "device_type": device_type,
+            "device_state": device_state,
+            "active_connection": active_connection,
+        }
+    )
+    if device_type != "wifi":
+        return local_failure(WIFI_IFACE + " is not a Wi-Fi device", details)
+    if not device_state.startswith("connected"):
+        return local_failure("Wi-Fi is not connected: " + device_state, details)
+
+    show = nmcli(
+        ["-t", "-f", "GENERAL.CONNECTION,IP4.ADDRESS,IP4.GATEWAY", "device", "show", WIFI_IFACE]
+    )
+    details["device_show_rc"] = show["rc"]
+    if show["rc"] != 0:
+        return local_failure("Wi-Fi details not readable: " + show["out"], details)
+
+    values, multi = parse_nmcli_key_values(show["out"])
+    connection = values.get("GENERAL.CONNECTION") or active_connection
+    ipv4 = next((value for value in multi.get("IP4.ADDRESS", []) if value), "")
+    gateway = values.get("IP4.GATEWAY", "")
+    details.update(
+        {
+            "active_connection": connection,
+            "ipv4": ipv4,
+            "gateway": gateway,
+        }
+    )
+
+    if not ipv4:
+        return local_failure("Wi-Fi has no IPv4 address", details)
+    if not gateway:
+        return local_failure("Wi-Fi has no gateway", details)
+
+    ping = binary("ping")
+    if not ping:
+        return {
+            "ok": False,
+            "failure_class": "networkmanager-missing",
+            "failure_reason": "ping missing, local check not possible",
+            "details": details,
+        }
+
+    gateway_check = run_command([ping, "-c", "1", "-W", "2", gateway], timeout=GATEWAY_TIMEOUT_SECONDS)
+    details["gateway_ping_rc"] = gateway_check["rc"]
+    if gateway_check["rc"] != 0:
+        details["gateway_ping_output"] = gateway_check["out"]
+        return local_failure("Gateway not reachable: " + gateway, details)
+
+    dns_ok, dns_output = dns_resolves(DNS_PROBE_HOST)
+    details["dns_output"] = trim(dns_output, 500)
+    if not dns_ok:
+        return {
+            "ok": False,
+            "failure_class": "dns-degraded",
+            "failure_reason": "DNS resolution failed: " + DNS_PROBE_HOST,
+            "details": details,
+        }
+
+    return {
+        "ok": True,
+        "failure_class": "",
+        "failure_reason": "",
+        "details": details,
+    }
+
+
+def reconnect_wifi(config, before_details):
+    connection = str(before_details.get("active_connection", "") or "").strip()
+    actions = []
+    if connection and connection != "--":
+        actions.append(
+            {
+                "cmd": "nmcli connection up " + connection,
+                "result": nmcli(
+                    ["connection", "up", "id", connection, "ifname", WIFI_IFACE],
+                    timeout=RECONNECT_TIMEOUT_SECONDS,
+                ),
+            }
+        )
+
+    if not actions or actions[-1]["result"]["rc"] != 0:
+        actions.append(
+            {
+                "cmd": "nmcli device connect " + WIFI_IFACE,
+                "result": nmcli(["device", "connect", WIFI_IFACE], timeout=RECONNECT_TIMEOUT_SECONDS),
+            }
+        )
+
+    wait_seconds = clamp_int(
+        config.get("NETWORK_GUARDIAN_RECONNECT_WAIT_SECONDS"),
+        90,
+        minimum=0,
+        maximum=MAX_RECONNECT_WAIT_SECONDS,
+    )
+    if wait_seconds > 0:
+        time.sleep(wait_seconds)
+
+    return actions, check_network()
+
+
+def reconnect_normal_wifi(config, previous):
+    normal_connection = str(previous.get("normal_connection", "") or "").strip()
+    if not normal_connection:
+        details = previous.get("details", {}) if isinstance(previous.get("details"), dict) else {}
+        normal_connection = str(details.get("active_connection", "") or "").strip()
+
+    actions = []
+    if normal_connection and normal_connection not in {"--", AP_CONNECTION_NAME}:
+        actions.append(
+            {
+                "cmd": "nmcli connection up " + normal_connection,
+                "result": nmcli(
+                    ["connection", "up", "id", normal_connection, "ifname", WIFI_IFACE],
+                    timeout=RECONNECT_TIMEOUT_SECONDS,
+                ),
+            }
+        )
+
+    if not actions or actions[-1]["result"]["rc"] != 0:
+        actions.append(
+            {
+                "cmd": "nmcli device connect " + WIFI_IFACE,
+                "result": nmcli(["device", "connect", WIFI_IFACE], timeout=RECONNECT_TIMEOUT_SECONDS),
+            }
+        )
+
+    wait_seconds = clamp_int(
+        config.get("NETWORK_GUARDIAN_RECOVERY_WAIT_SECONDS"),
+        90,
+        minimum=0,
+        maximum=MAX_RECOVERY_WAIT_SECONDS,
+    )
+    if wait_seconds > 0:
+        time.sleep(wait_seconds)
+
+    return actions, check_network()
+
+
+def emergency_ui_activity(config):
+    try:
+        with open(UI_ACTIVITY_FILE, "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+    except (OSError, ValueError):
+        data = {}
+    if not isinstance(data, dict):
+        data = {}
+
+    grace = clamp_int(
+        config.get("NETWORK_GUARDIAN_UI_ACTIVE_GRACE_SECONDS"),
+        120,
+        minimum=30,
+        maximum=3600,
+    )
+    age = seconds_since(data.get("last_seen"))
+    active = age is not None and age <= grace
+    return {
+        "active": active,
+        "last_seen": data.get("last_seen", ""),
+        "age_seconds": age,
+        "grace_seconds": grace,
+        "route": data.get("route", ""),
+        "session_id": data.get("session_id", ""),
+    }
+
+
+def base_state(config, previous):
+    interval = clamp_int(
+        config.get("NETWORK_GUARDIAN_CHECK_INTERVAL_SECONDS"),
+        300,
+        minimum=60,
+        maximum=3600,
+    )
+    return {
+        "phase": 3,
+        "last_check_at": iso_now(),
+        "next_action_not_before": iso_after(interval),
+        "last_ok_at": previous.get("last_ok_at", ""),
+        "config": {
+            "check_interval_seconds": interval,
+            "fails_before_ap": clamp_int(
+                config.get("NETWORK_GUARDIAN_FAILS_BEFORE_AP"),
+                3,
+                minimum=1,
+                maximum=20,
+            ),
+            "reconnect_wait_seconds": clamp_int(
+                config.get("NETWORK_GUARDIAN_RECONNECT_WAIT_SECONDS"),
+                90,
+                minimum=0,
+                maximum=MAX_RECONNECT_WAIT_SECONDS,
+            ),
+            "ap_min_seconds": clamp_int(
+                config.get("NETWORK_GUARDIAN_AP_MIN_SECONDS"),
+                600,
+                minimum=60,
+                maximum=7200,
+            ),
+            "recovery_wait_seconds": clamp_int(
+                config.get("NETWORK_GUARDIAN_RECOVERY_WAIT_SECONDS"),
+                90,
+                minimum=0,
+                maximum=MAX_RECOVERY_WAIT_SECONDS,
+            ),
+            "ui_active_grace_seconds": clamp_int(
+                config.get("NETWORK_GUARDIAN_UI_ACTIVE_GRACE_SECONDS"),
+                120,
+                minimum=30,
+                maximum=3600,
+            ),
+            "ap_password_set": bool(str(config.get("NETWORK_GUARDIAN_AP_PASSWORD", "")).strip()),
+            "ap_connection": AP_CONNECTION_NAME,
+            "ap_ssid": ap_settings(config)["ssid"],
+            "ap_ipv4": ap_settings(config)["ipv4"],
+        },
+    }
+
+
+def build_disabled_state(config, previous, state_name, reason):
+    state = base_state(config, previous)
+    state.update(
+        {
+            "state": state_name,
+            "failure_class": "",
+            "failure_reason": reason,
+            "failure_count": 0,
+            "next_action": "none",
+        }
+    )
+    return state
+
+
+def recovery_due_from(ap_started_at, state):
+    min_seconds = state["config"]["ap_min_seconds"]
+    started_dt = parse_iso_datetime(ap_started_at)
+    if started_dt is None:
+        return iso_after(min_seconds)
+    return iso_datetime(started_dt + timedelta(seconds=min_seconds))
+
+
+def normal_connection_from_details(details):
+    connection = str(details.get("active_connection", "") or "").strip()
+    if connection and connection not in {"--", AP_CONNECTION_NAME}:
+        return connection
+    return ""
+
+
+def start_ap_state(config, previous, state, failure_count, failure_class, failure_reason, details):
+    start = start_emergency_ap(config)
+    normal_connection = normal_connection_from_details(details)
+    if not normal_connection:
+        normal_connection = str(previous.get("normal_connection", "") or "").strip()
+
+    state["ap"] = start.get("ap", {})
+    state["normal_connection"] = normal_connection
+    state["failure_count"] = failure_count
+    state["failure_class"] = failure_class
+
+    if not start["ok"]:
+        state.update(
+            {
+                "state": "ap_blocked",
+                "failure_reason": start["reason"],
+                "next_action": "check AP configuration",
+            }
+        )
+        return state
+
+    ap_started_at = iso_now()
+    state.update(
+        {
+            "state": "emergency_ap",
+            "failure_reason": failure_reason,
+            "next_action": "recovery after AP minimum runtime",
+            "ap_started_at": ap_started_at,
+            "ap_elapsed_seconds": 0,
+            "recovery_due_at": recovery_due_from(ap_started_at, state),
+            "ap_cycle_count": clamp_int(previous.get("ap_cycle_count"), 0, minimum=0, maximum=999) + 1,
+        }
+    )
+    return state
+
+
+def recovery_test(config, previous, current_state):
+    recovery_state = dict(current_state)
+    recovery_state.update(
+        {
+            "state": "recovery_test",
+            "next_action": "stop emergency AP and test normal Wi-Fi",
+            "recovery_started_at": iso_now(),
+        }
+    )
+    write_state(recovery_state)
+
+    stop = stop_emergency_ap()
+    actions, result = reconnect_normal_wifi(config, previous)
+    action_log = [
+        {
+            "cmd": item["cmd"],
+            "rc": item["result"]["rc"],
+            "out": trim(item["result"]["out"], 500),
+        }
+        for item in actions
+    ]
+
+    state = base_state(config, previous)
+    state["recovery"] = {
+        "started_at": recovery_state["recovery_started_at"],
+        "stop_ap": stop,
+        "actions": action_log,
+    }
+    state["details"] = result.get("details", {})
+    state["ap_cycle_count"] = clamp_int(previous.get("ap_cycle_count"), 0, minimum=0, maximum=999)
+
+    if result["ok"]:
+        state.update(
+            {
+                "state": "normal",
+                "last_ok_at": iso_now(),
+                "failure_class": "",
+                "failure_reason": "",
+                "failure_count": 0,
+                "next_action": "recovery successful, next check",
+                "normal_connection": normal_connection_from_details(result.get("details", {})),
+            }
+        )
+        return state
+
+    if result["failure_class"] != "local-network-down":
+        state.update(
+            {
+                "state": "degraded" if result["failure_class"] == "dns-degraded" else "blocked",
+                "failure_class": result["failure_class"],
+                "failure_reason": result["failure_reason"],
+                "failure_count": 0,
+                "next_action": "recovery ended, no AP start for " + result["failure_class"],
+            }
+        )
+        return state
+
+    count = clamp_int(previous.get("failure_count"), 0, minimum=0, maximum=999) + 1
+    restart_state = start_ap_state(
+        config,
+        previous,
+        state,
+        count,
+        result["failure_class"],
+        result["failure_reason"],
+        result.get("details", {}),
+    )
+    restart_state["recovery"] = state["recovery"]
+    if restart_state["state"] == "emergency_ap":
+        restart_state["next_action"] = "recovery failed, AP active again"
+        restart_state["recovery_due_at"] = recovery_due_from(restart_state.get("ap_started_at", ""), restart_state)
+    return restart_state
+
+
+def handle_emergency_ap(config, previous):
+    state = base_state(config, previous)
+    active, active_info = ap_is_active()
+    state["ap"] = {"connection": AP_CONNECTION_NAME, "active_check": active_info}
+
+    if not active:
+        result = check_network()
+        state["details"] = result.get("details", {})
+        if result["ok"]:
+            state.update(
+                {
+                    "state": "normal",
+                    "last_ok_at": state["last_check_at"],
+                    "failure_class": "",
+                    "failure_reason": "",
+                    "failure_count": 0,
+                    "next_action": "AP not active, normal Wi-Fi is OK again",
+                    "normal_connection": normal_connection_from_details(result.get("details", {})),
+                }
+            )
+            return state
+
+        count = clamp_int(previous.get("failure_count"), 0, minimum=0, maximum=999) + 1
+        return start_ap_state(
+            config,
+            previous,
+            state,
+            count,
+            result["failure_class"],
+            result["failure_reason"],
+            result.get("details", {}),
+        )
+
+    ap_started_at = iso_from_existing_or_now(previous.get("ap_started_at"))
+    ap_elapsed = seconds_since(ap_started_at) or 0
+    min_seconds = state["config"]["ap_min_seconds"]
+    ui_activity = emergency_ui_activity(config)
+
+    state.update(
+        {
+            "state": "emergency_ap",
+            "failure_class": previous.get("failure_class", "local-network-down"),
+            "failure_reason": previous.get("failure_reason", "Emergency AP active"),
+            "failure_count": clamp_int(previous.get("failure_count"), 0, minimum=0, maximum=999),
+            "normal_connection": previous.get("normal_connection", ""),
+            "ap_started_at": ap_started_at,
+            "ap_elapsed_seconds": ap_elapsed,
+            "ap_cycle_count": clamp_int(previous.get("ap_cycle_count"), 0, minimum=0, maximum=999),
+            "ui_activity": ui_activity,
+        }
+    )
+
+    if ap_elapsed < min_seconds:
+        state["recovery_due_at"] = recovery_due_from(ap_started_at, state)
+        state["next_action"] = "AP minimum runtime running"
+        return state
+
+    state["recovery_due_at"] = recovery_due_from(ap_started_at, state)
+
+    if ui_activity["active"]:
+        state["state"] = "manual_hold"
+        state["next_action"] = "recovery delayed by AP WebUI activity"
+        return state
+
+    return recovery_test(config, previous, state)
+
+
+def evaluate(config, previous):
+    if not truthy(config.get("NETWORK_GUARDIAN_ENABLED")):
+        return build_disabled_state(config, previous, "disabled", "Network Guardian is disabled")
+
+    if not os.path.exists(ALLOW_FILE):
+        return build_disabled_state(config, previous, "gate_missing", "Guardian-Gate missing")
+
+    if previous.get("state") in {"emergency_ap", "manual_hold", "recovery_test"}:
+        return handle_emergency_ap(config, previous)
+
+    result = check_network()
+    state = base_state(config, previous)
+    details = result.get("details", {})
+    state["details"] = details
+
+    if result["ok"]:
+        state.update(
+            {
+                "state": "normal",
+                "last_ok_at": state["last_check_at"],
+                "failure_class": "",
+                "failure_reason": "",
+                "failure_count": 0,
+                "next_action": "next check",
+            }
+        )
+        return state
+
+    failure_class = result["failure_class"]
+    failure_reason = result["failure_reason"]
+    previous_count = clamp_int(previous.get("failure_count"), 0, minimum=0, maximum=999)
+    previous_class = str(previous.get("failure_class") or "")
+    local_count = previous_count + 1 if previous_class == "local-network-down" else 1
+
+    if failure_class == "local-network-down":
+        fails_before_ap = state["config"]["fails_before_ap"]
+        if local_count >= fails_before_ap:
+            actions, after_reconnect = reconnect_wifi(config, details)
+            state["reconnect_attempted_at"] = iso_now()
+            state["reconnect_actions"] = [
+                {
+                    "cmd": item["cmd"],
+                    "rc": item["result"]["rc"],
+                    "out": trim(item["result"]["out"], 500),
+                }
+                for item in actions
+            ]
+            state["details_after_reconnect"] = after_reconnect.get("details", {})
+            if after_reconnect["ok"]:
+                state.update(
+                    {
+                        "state": "normal",
+                        "last_ok_at": state["reconnect_attempted_at"],
+                        "failure_class": "",
+                        "failure_reason": "",
+                        "failure_count": 0,
+                        "next_action": "reconnect successful, next check",
+                    }
+                )
+                return state
+
+            if after_reconnect["failure_class"] != "local-network-down":
+                state.update(
+                    {
+                        "state": "degraded" if after_reconnect["failure_class"] == "dns-degraded" else "blocked",
+                        "failure_class": after_reconnect["failure_class"],
+                        "failure_reason": after_reconnect["failure_reason"],
+                        "failure_count": 0,
+                        "next_action": "no AP start for " + after_reconnect["failure_class"],
+                    }
+                )
+                return state
+
+            return start_ap_state(
+                config,
+                previous,
+                state,
+                local_count,
+                after_reconnect["failure_class"],
+                after_reconnect["failure_reason"],
+                after_reconnect.get("details", {}),
+            )
+
+        state.update(
+            {
+                "state": "suspect",
+                "failure_class": failure_class,
+                "failure_reason": failure_reason,
+                "failure_count": local_count,
+                "next_action": "Reconnect ab Error " + str(state["config"]["fails_before_ap"]),
+            }
+        )
+        return state
+
+    state.update(
+        {
+            "state": "degraded" if failure_class == "dns-degraded" else "blocked",
+            "failure_class": failure_class,
+            "failure_reason": failure_reason,
+            "failure_count": 0,
+            "next_action": "no AP start for " + failure_class,
+        }
+    )
+    return state
+
+
+def main():
+    config = read_config()
+    previous = load_state()
+    state = evaluate(config, previous)
+    write_state(state)
+    print(
+        "network-guardian state={state} class={failure_class} count={failure_count} next={next_action}".format(
+            state=state.get("state", "-"),
+            failure_class=state.get("failure_class", "-"),
+            failure_count=state.get("failure_count", 0),
+            next_action=state.get("next_action", "-"),
+        )
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

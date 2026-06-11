@@ -1,0 +1,18 @@
+[Unit]
+Description=vdisk-relay format image on boot if requested
+After=local-fs.target
+Before=vdisk-relay-gadget-live.service
+ConditionPathExists=/etc/vdisk-relay.format-on-boot
+ConditionPathExists=/usr/local/bin/format-vdisk
+ConditionPathExists=/usbdisk.img
+
+[Service]
+Type=oneshot
+ExecStartPre=/bin/bash -lc 'mkdir -p /run/vdisk-relay; /usr/local/sbin/vdisk-relay preview-suspend begin format-on-boot > /run/vdisk-relay/format-on-boot.preview-token'
+ExecStart=/bin/bash -lc 'rm -f /etc/vdisk-relay.format-on-boot; /usr/local/bin/format-vdisk'
+ExecStartPost=/bin/bash -lc 'token="$(cat /run/vdisk-relay/format-on-boot.preview-token 2>/dev/null || true)"; if [ -n "$token" ]; then /usr/local/sbin/vdisk-relay preview-suspend end "$token" || true; fi; rm -f /run/vdisk-relay/format-on-boot.preview-token'
+ExecStopPost=/bin/bash -lc 'token="$(cat /run/vdisk-relay/format-on-boot.preview-token 2>/dev/null || true)"; if [ -n "$token" ]; then /usr/local/sbin/vdisk-relay preview-suspend end "$token" || true; fi; rm -f /run/vdisk-relay/format-on-boot.preview-token'
+Nice=10
+
+[Install]
+WantedBy=multi-user.target

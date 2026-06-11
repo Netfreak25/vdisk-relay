@@ -1,0 +1,14 @@
+[Unit]
+Description=vdisk-relay ultra fast direct image send after pending
+After=local-fs.target
+ConditionPathExists=/usr/local/sbin/vdisk-relay
+ConditionPathExists=/usbdisk.img
+ConditionPathExists=/etc/vdisk-relay.live-enabled
+ConditionPathExists=/etc/vdisk-relay.allow-sync
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/vdisk-relay ultra-fast-sync
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7

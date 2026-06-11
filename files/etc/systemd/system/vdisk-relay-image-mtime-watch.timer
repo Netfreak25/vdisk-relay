@@ -1,0 +1,13 @@
+[Unit]
+Description=vdisk-relay lightweight image mtime fallback timer
+ConditionPathExists=/etc/vdisk-relay.live-enabled
+ConditionPathExists=/etc/vdisk-relay.allow-sync
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=30s
+AccuracySec=5s
+Unit=vdisk-relay-image-mtime-watch.service
+
+[Install]
+WantedBy=timers.target

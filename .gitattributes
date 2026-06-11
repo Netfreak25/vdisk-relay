@@ -1,0 +1,13 @@
+.gitattributes text eol=lf
+.gitignore text eol=lf
+*.md text eol=lf
+*.txt text eol=lf
+deploy/bookworm/*.sh text eol=lf
+deploy/bookworm/templates/* text eol=lf
+files/etc/*.conf text eol=lf
+files/etc/*.example text eol=lf
+files/etc/systemd/system/* text eol=lf
+files/etc/update-motd.d/* text eol=lf
+files/usr/local/bin/* text eol=lf
+files/usr/local/sbin/* text eol=lf
+files/usr/local/share/vdisk-relay/i18n/*.json text eol=lf

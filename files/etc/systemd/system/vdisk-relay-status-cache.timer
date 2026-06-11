@@ -1,0 +1,11 @@
+[Unit]
+Description=vdisk-relay cached login status timer
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=2min
+AccuracySec=30s
+Unit=vdisk-relay-status-cache.service
+
+[Install]
+WantedBy=timers.target

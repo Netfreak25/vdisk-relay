@@ -1,0 +1,7 @@
+#!/bin/sh
+
+[ -r /run/vdisk-relay/status-login.txt ] || exit 0
+
+echo
+cat /run/vdisk-relay/status-login.txt
+echo

@@ -1,0 +1,7 @@
+[Unit]
+Description=vdisk-relay web status cache
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/vdisk-relay-web-status-cache
+Nice=10

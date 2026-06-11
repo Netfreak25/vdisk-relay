@@ -1,0 +1,11 @@
+[Unit]
+Description=Run vdisk-relay update availability check periodically
+
+[Timer]
+OnBootSec=3min
+OnUnitActiveSec=6h
+Persistent=true
+Unit=vdisk-relay-update-check.service
+
+[Install]
+WantedBy=timers.target

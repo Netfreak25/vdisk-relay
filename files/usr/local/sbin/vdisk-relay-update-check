@@ -1,0 +1,333 @@
+#!/usr/bin/env python3
+import datetime
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import traceback
+
+STATE_DIR = "/var/lib/vdisk-relay"
+UPDATE_DIR = f"{STATE_DIR}/update"
+REPO_ROOT_FILE = f"{STATE_DIR}/repo-root"
+STATUS_FILE = f"{STATE_DIR}/update-check.json"
+LOG_FILE = f"{UPDATE_DIR}/update-check.log"
+GIT_CREDENTIALS_FILE = f"{STATE_DIR}/git-credentials.json"
+GIT_ASKPASS = "/usr/local/sbin/vdisk-relay-git-askpass"
+
+
+def now_iso():
+    return datetime.datetime.now(datetime.timezone.utc).astimezone().isoformat(timespec="seconds")
+
+
+def ensure_dirs():
+    os.makedirs(STATE_DIR, mode=0o755, exist_ok=True)
+    os.makedirs(UPDATE_DIR, mode=0o755, exist_ok=True)
+
+
+def read_file(path, default=""):
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as handle:
+            return handle.read()
+    except FileNotFoundError:
+        return default
+
+
+def trim(text, limit=1600):
+    text = (text or "").strip()
+    if len(text) <= limit:
+        return text
+    return text[:limit] + "... [trimmed]"
+
+
+def log(text):
+    ensure_dirs()
+    with open(LOG_FILE, "a", encoding="utf-8", errors="replace") as handle:
+        handle.write(now_iso() + " " + str(text).rstrip() + "\n")
+
+
+def write_json(path, data):
+    ensure_dirs()
+    data.setdefault("log_file", LOG_FILE)
+    data.setdefault("status_file", STATUS_FILE)
+    fd, tmp = tempfile.mkstemp(prefix=os.path.basename(path) + ".", dir=os.path.dirname(path))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(data, handle, ensure_ascii=False, indent=2, sort_keys=True)
+            handle.write("\n")
+        os.chmod(tmp, 0o644)
+        os.replace(tmp, path)
+    finally:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+
+
+def repo_owner(repo):
+    try:
+        import pwd
+        return pwd.getpwuid(os.stat(repo).st_uid).pw_name
+    except Exception:
+        return ""
+
+
+def git_identity(repo):
+    return {
+        "effective_uid": os.geteuid() if hasattr(os, "geteuid") else "",
+        "run_as": "root/current-user",
+        "repo_owner": repo_owner(repo),
+        "credential_scope": GIT_CREDENTIALS_FILE,
+    }
+
+
+def git_credentials_status():
+    try:
+        with open(GIT_CREDENTIALS_FILE, "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+    except Exception:
+        return {
+            "configured": False,
+            "file": GIT_CREDENTIALS_FILE,
+            "message": "Git credentials missing",
+        }
+
+    username = str(data.get("username", ""))
+    token = str(data.get("token", ""))
+    host = str(data.get("host", ""))
+    return {
+        "configured": bool(username and token),
+        "file": GIT_CREDENTIALS_FILE,
+        "host": host,
+        "username": username,
+        "token_present": bool(token),
+        "askpass": GIT_ASKPASS,
+        "message": "Git credentials stored" if username and token else "Git-Credentials incomplete",
+    }
+
+
+def mask_remote_url(url):
+    url = (url or "").strip()
+    return re.sub(r"(https?://)([^/@:]+)(:[^/@]*)?@", r"\1***@", url)
+
+
+def disable_update_units_without_credentials():
+    systemctl = shutil.which("systemctl") or "/bin/systemctl"
+    try:
+        subprocess.run(
+            [systemctl, "disable", "--now", "vdisk-relay-update-check.timer"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=15,
+            check=False,
+        )
+        subprocess.run(
+            [systemctl, "stop", "vdisk-relay-update.service", "vdisk-relay-update-check.service"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=15,
+            check=False,
+        )
+        log("update units disabled because git credentials are missing")
+    except Exception as exc:
+        log("update unit disable failed: " + str(exc))
+
+
+def git_command(repo, args):
+    return ["git", "-c", f"safe.directory={repo}", "-C", repo] + list(args)
+
+
+def run_git(repo, args, timeout=30):
+    cmd = git_command(repo, args)
+    credentials = git_credentials_status()
+    askpass = GIT_ASKPASS
+    if not credentials.get("configured") or not os.path.isfile(askpass) or not os.access(askpass, os.X_OK):
+        askpass = "/bin/false"
+    env = os.environ.copy()
+    env["DISPLAY"] = env.get("DISPLAY", ":0")
+    env["GIT_TERMINAL_PROMPT"] = "0"
+    env["GIT_ASKPASS_REQUIRE"] = "force"
+    env["SSH_ASKPASS"] = askpass
+    env["GIT_ASKPASS"] = askpass
+    log("git helper askpass=" + ("configured" if askpass != "/bin/false" else "disabled"))
+    log("git start args=" + json.dumps(list(args), ensure_ascii=False))
+    try:
+        proc = subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            env=env,
+            timeout=timeout,
+            check=False,
+        )
+        out = trim(proc.stdout)
+        log("git done rc={} args={} out={}".format(proc.returncode, json.dumps(list(args), ensure_ascii=False), out))
+        return proc.returncode, out
+    except subprocess.TimeoutExpired:
+        msg = f"TIMEOUT after {timeout}s"
+        log("git timeout args={} {}".format(json.dumps(list(args), ensure_ascii=False), msg))
+        return 124, msg
+    except Exception as exc:
+        msg = f"ERROR: {exc}"
+        log("git exception args={} {}".format(json.dumps(list(args), ensure_ascii=False), msg))
+        return 1, msg
+
+
+def git_value(repo, args, default=""):
+    rc, out = run_git(repo, args, 12)
+    return out.strip() if rc == 0 else default
+
+
+def status_error(message, repo="", diagnostics="", extra=None):
+    data = {
+        "status": "error",
+        "available": False,
+        "checked_at": now_iso(),
+        "repo_root": repo,
+        "message": message,
+        "diagnostics": trim(diagnostics),
+    }
+    if repo:
+        data["git_identity"] = git_identity(repo)
+    if extra:
+        data.update(extra)
+    return data
+
+
+def main_inner():
+    ensure_dirs()
+    log("update-check start")
+
+    repo = read_file(REPO_ROOT_FILE).strip()
+    write_json(STATUS_FILE, {
+        "status": "running",
+        "available": False,
+        "checked_at": now_iso(),
+        "repo_root": repo,
+        "message": "Update check running",
+        "diagnostics": "",
+    })
+
+    if not repo:
+        msg = f"{REPO_ROOT_FILE} is not available or is empty"
+        log(msg)
+        write_json(STATUS_FILE, status_error("Repository path missing", diagnostics=msg))
+        return 0
+
+    repo = os.path.realpath(repo)
+    if not os.path.isdir(repo):
+        msg = "Repository path does not exist"
+        log(msg + ": " + repo)
+        write_json(STATUS_FILE, status_error(msg, repo=repo))
+        return 0
+
+    log("repo=" + repo + " identity=" + json.dumps(git_identity(repo), ensure_ascii=False, sort_keys=True))
+
+    rc, inside = run_git(repo, ["rev-parse", "--is-inside-work-tree"], 8)
+    if rc != 0 or inside.strip() != "true":
+        write_json(STATUS_FILE, status_error("No Git checkout", repo=repo, diagnostics=inside))
+        return 0
+
+    branch = git_value(repo, ["rev-parse", "--abbrev-ref", "HEAD"], "unknown")
+    local_commit = git_value(repo, ["rev-parse", "HEAD"])
+    local_short = git_value(repo, ["rev-parse", "--short", "HEAD"])
+    remote_url = git_value(repo, ["config", "--get", "remote.origin.url"])
+
+    credentials = git_credentials_status()
+    if remote_url.startswith("http") and not credentials.get("configured"):
+        disable_update_units_without_credentials()
+        write_json(STATUS_FILE, status_error(
+            "Git credentials missing",
+            repo=repo,
+            diagnostics="HTTPS remote requires credentials. Store them in the WebUI under Settings > Git.",
+            extra={
+                "branch": branch,
+                "current_commit": local_commit,
+                "current_short": local_short,
+                "remote_url": mask_remote_url(remote_url),
+                "git_credentials": credentials,
+            },
+        ))
+        return 0
+
+    rc, fetch_out = run_git(repo, ["fetch", "--quiet", "--prune"], 90)
+    if rc != 0:
+        diag = (
+            "remote=" + mask_remote_url(remote_url)
+            + " | creds_configured=" + str(credentials.get("configured", False))
+            + " | fetch_rc=" + str(rc)
+            + " | out=" + fetch_out
+        )
+        write_json(STATUS_FILE, status_error("Git fetch failed", repo=repo, diagnostics=diag))
+        return 0
+
+    upstream = git_value(repo, ["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"])
+    if not upstream and branch not in ("", "HEAD", "unknown"):
+        candidate = "origin/" + branch
+        if git_value(repo, ["rev-parse", "--verify", candidate]):
+            upstream = candidate
+
+    if not upstream:
+        write_json(STATUS_FILE, status_error("No upstream branch found", repo=repo, diagnostics=f"branch={branch}"))
+        return 0
+
+    remote_commit = git_value(repo, ["rev-parse", upstream])
+    remote_short = git_value(repo, ["rev-parse", "--short", upstream])
+    if not remote_commit:
+        write_json(STATUS_FILE, status_error("Remote commit not readable", repo=repo, diagnostics=f"upstream={upstream}"))
+        return 0
+
+    rc, counts = run_git(repo, ["rev-list", "--left-right", "--count", f"HEAD...{upstream}"], 20)
+    if rc != 0:
+        write_json(STATUS_FILE, status_error("Commit distance not readable", repo=repo, diagnostics=counts))
+        return 0
+
+    try:
+        ahead_raw, behind_raw = counts.split()[:2]
+        ahead = int(ahead_raw)
+        behind = int(behind_raw)
+    except Exception:
+        ahead = 0
+        behind = 0
+
+    if behind > 0:
+        message = f"Update available: {behind} commit(s) behind {upstream}"
+    elif ahead > 0:
+        message = f"Local checkout is {ahead} commit(s) ahead of {upstream}"
+    else:
+        message = "Checkout is current"
+
+    write_json(STATUS_FILE, {
+        "status": "ok",
+        "available": behind > 0,
+        "checked_at": now_iso(),
+        "repo_root": repo,
+        "branch": branch,
+        "upstream": upstream,
+        "current_commit": local_commit,
+        "current_short": local_short,
+        "remote_commit": remote_commit,
+        "remote_short": remote_short,
+        "ahead": ahead,
+        "behind": behind,
+        "message": message,
+        "diagnostics": "",
+        "git_identity": git_identity(repo),
+    })
+    log("update-check done status=ok behind={} ahead={}".format(behind, ahead))
+    return 0
+
+
+def main():
+    try:
+        return main_inner()
+    except Exception as exc:
+        tb = traceback.format_exc()
+        log("update-check fatal " + tb)
+        write_json(STATUS_FILE, status_error("Update-Check Error", diagnostics=str(exc), extra={"traceback": trim(tb)}))
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,0 +1,13 @@
+[Unit]
+Description=vdisk-relay live path trigger for /usbdisk.img
+ConditionPathExists=/usr/local/sbin/vdisk-relay
+ConditionPathExists=/usbdisk.img
+ConditionPathExists=/etc/vdisk-relay.live-enabled
+ConditionPathExists=/etc/vdisk-relay.allow-watch
+
+[Path]
+PathChanged=/usbdisk.img
+Unit=vdisk-relay-trigger-live.service
+
+[Install]
+WantedBy=multi-user.target

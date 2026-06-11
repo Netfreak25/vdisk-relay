@@ -1,0 +1,3 @@
+#!/usr/bin/env bash
+echo "video-vdisk was replaced by vdisk-relay. Please use /usr/local/sbin/vdisk-relay." >&2
+exit 64

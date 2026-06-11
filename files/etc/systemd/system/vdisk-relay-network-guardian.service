@@ -1,0 +1,15 @@
+[Unit]
+Description=vdisk-relay Network Guardian check
+Documentation=file:/usr/local/sbin/vdisk-relay-network-guardian
+After=NetworkManager.service
+Wants=NetworkManager.service
+ConditionPathExists=/etc/vdisk-relay.allow-network-guardian
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/vdisk-relay-network-guardian
+Nice=10
+IOSchedulingClass=idle
+TimeoutStartSec=7min
+TimeoutStopSec=5s
+KillMode=control-group

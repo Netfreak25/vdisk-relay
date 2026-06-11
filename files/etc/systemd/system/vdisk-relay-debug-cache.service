@@ -1,0 +1,7 @@
+[Unit]
+Description=vdisk-relay debug status cache
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/vdisk-relay-debug-cache
+Nice=10

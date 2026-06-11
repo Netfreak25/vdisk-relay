@@ -1,0 +1,13 @@
+[Unit]
+Description=vdisk-relay live retry timer
+ConditionPathExists=/etc/vdisk-relay.live-enabled
+ConditionPathExists=/etc/vdisk-relay.allow-sync
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=10s
+AccuracySec=10s
+Unit=vdisk-relay-retry-live.service
+
+[Install]
+WantedBy=timers.target

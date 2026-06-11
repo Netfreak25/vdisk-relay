@@ -1,0 +1,13 @@
+[Unit]
+Description=vdisk-relay preview cache
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/vdisk-relay-preview-cache
+Nice=19
+IOSchedulingClass=idle
+CPUWeight=1
+IOWeight=1
+TimeoutStartSec=15min
+TimeoutStopSec=5s
+KillMode=control-group

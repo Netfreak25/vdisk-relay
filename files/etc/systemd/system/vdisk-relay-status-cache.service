@@ -1,0 +1,7 @@
+[Unit]
+Description=vdisk-relay cached login status
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/vdisk-relay-status-cache
+Nice=10

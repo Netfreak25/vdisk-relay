@@ -1,0 +1,15 @@
+[Unit]
+Description=vdisk-relay live USB mass storage gadget
+After=local-fs.target vdisk-relay-format-on-boot.service
+ConditionPathExists=/usr/local/sbin/vdisk-relay
+ConditionPathExists=/usbdisk.img
+ConditionPathExists=/etc/vdisk-relay.live-enabled
+ConditionPathExists=/etc/vdisk-relay.allow-gadget
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/vdisk-relay gadget-start --apply
+
+[Install]
+WantedBy=multi-user.target

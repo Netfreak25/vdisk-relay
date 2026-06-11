@@ -1,0 +1,4066 @@
+#!/usr/bin/env bash
+set -u
+
+VERSION="0.2-shadow"
+CONFIG_FILE="${VDISK_RELAY_CONFIG:-/etc/vdisk-relay.conf}"
+ENV_FILE="${VDISK_RELAY_ENV:-/etc/vdisk-relay.env}"
+
+IMAGE_FILE="/usbdisk.img"
+MOUNTPOINT="/run/vdisk-relay/mnt"
+DATA_ROOT="/files"
+PREVIEW_DIR="/var/cache/vdisk-relay-previews"
+PREVIEW_INDEX="$PREVIEW_DIR/index.json"
+PREVIEW_BACKLOG="$PREVIEW_DIR/backlog.json"
+ARCHIVE_RSYNC_TARGET=""
+ARCHIVE_RSYNC_PASSWORD_FILE="/root/vdisk-relay-rsync.pass"
+ARCHIVE_RSYNC_MAX_SECONDS="900"
+ARCHIVE_RSYNC_CONTIMEOUT="10"
+ARCHIVE_RSYNC_TIMEOUT="60"
+STATE_DIR="/var/lib/vdisk-relay"
+RUN_DIR="/run/vdisk-relay"
+LOG_FILE="/var/log/vdisk-relay.log"
+PARTITION_OFFSET_SECTORS="2048"
+MOUNT_FSTYPE="vfat"
+WATCH_EVENT="modify"
+WATCH_DEBOUNCE_SECONDS="2"
+MAX_DATA_AGE_SECONDS="$((28*60*60))"
+IMAGE_STALE_SECONDS="$MAX_DATA_AGE_SECONDS"
+IMAGE_STALE_REBOOT_COOLDOWN_SECONDS="$((4*60*60))"
+CURL_MAX_TIME="120"
+TELEGRAM_TEXT_RETRIES="18"
+TELEGRAM_TEXT_RETRY_DELAY="10"
+TELEGRAM_TEXT_CURL_MAX_TIME="20"
+BOOT_NOTIFY_WAIT_SECONDS="180"
+BOOT_NOTIFY_WAIT_INTERVAL="5"
+GADGET_MODPROBE_ARGS="file=/usbdisk.img stall=0 ro=0 removable=1 iSerialNumber=1234567890"
+SYNC_PASSES="0.5 4 10"
+LIVE_QUIET_SECONDS="8"
+LIVE_FAST_LANE_ENABLED="1"
+LIVE_FAST_LANE_DELAY_SECONDS="3"
+LIVE_FAST_QUIET_SECONDS="3"
+SYNC_RSYNC_OPTIONS="-r --ignore-existing"
+SYNC_RSYNC_DRYRUN_OPTIONS="-n --ignore-existing --stats"
+TIMELINE_TRACE_ENABLED="0"
+TIMELINE_TRACE_FILE="/var/log/vdisk-relay-timeline.jsonl"
+TIMELINE_TRACE_SYSTEM_SNAPSHOT="0"
+TELEGRAM_TRACE_REPLY_BODY="0"
+TELEGRAM_TRACE_REPLY_MAX_BYTES="20000"
+DELETE_PREVIEW_WITH_VIDEO="0"
+ULTRA_FAST_LANE_ENABLED="0"
+ULTRA_FAST_LANE_DELAY_SECONDS="0"
+ULTRA_FAST_LANE_QUIET_SECONDS="0"
+ULTRA_FAST_LANE_SYNC_AFTER_SEND="1"
+ULTRA_FAST_DUPLICATE_MODE="filename"
+ULTRA_FAST_REMAINDER_QUEUE_ENABLED="1"
+ULTRA_FAST_REMAINDER_QUEUE_DELAY_SECONDS="2"
+TELEGRAM_QUEUE_ENABLED="1"
+TELEGRAM_QUEUE_RETRY_SECONDS="60"
+TELEGRAM_QUEUE_MAX_ATTEMPTS="30"
+TELEGRAM_QUEUE_PROCESS_LIMIT="2"
+TELEGRAM_QUEUE_DONE_MAX_FILES="200"
+
+SOURCES=()
+
+[ -r "$CONFIG_FILE" ] && . "$CONFIG_FILE"
+[ -r "$ENV_FILE" ] && . "$ENV_FILE"
+
+CONFIG_BACKUP_GIT_CREDENTIALS="/var/lib/vdisk-relay/git-credentials.json"
+CONFIG_BACKUP_NM_CONNECTION_DIR="/etc/NetworkManager/system-connections"
+CONFIG_BACKUP_SEND_STATE_DIR="/var/lib/vdisk-relay/last"
+CONFIG_BACKUP_SYSTEMD_UNITS=(
+  vdisk-relay-gadget-live.service
+  vdisk-relay-watch-live.path
+  vdisk-relay-trigger-live.service
+  vdisk-relay-fast-sync.service
+  vdisk-relay-ultra-fast-sync.service
+  vdisk-relay-sync-live.service
+  vdisk-relay-telegram-queue.service
+  vdisk-relay-telegram-queue.timer
+  vdisk-relay-retry-live.service
+  vdisk-relay-retry-live.timer
+  vdisk-relay-image-mtime-watch.service
+  vdisk-relay-image-mtime-watch.timer
+  vdisk-relay-watchdog-live.service
+  vdisk-relay-watchdog-live.timer
+  vdisk-relay-archive-live.service
+  vdisk-relay-archive-live.timer
+  vdisk-relay-health-live.service
+  vdisk-relay-health-live.timer
+  vdisk-relay-boot-notify-live.service
+  vdisk-relay-web.service
+  vdisk-relay-web-status-cache.service
+  vdisk-relay-web-status-cache.timer
+  vdisk-relay-status-cache.service
+  vdisk-relay-status-cache.timer
+  vdisk-relay-debug-cache.service
+  vdisk-relay-debug-cache.timer
+  vdisk-relay-network-guardian.service
+  vdisk-relay-network-guardian.timer
+  vdisk-relay-preview-cache.service
+  vdisk-relay-preview-cache.timer
+  vdisk-relay-update.service
+  vdisk-relay-update-check.service
+  vdisk-relay-update-check.timer
+  vdisk-relay-format-on-boot.service
+)
+
+usage() {
+  cat <<USAGE
+vdisk-relay $VERSION
+
+Shadow/parallel control for /usbdisk.img. Default is non-destructive.
+
+Kommandos:
+  status
+  status-lights [--live]
+  config-ready
+  config
+  ensure-config-defaults
+  config-backup [--output FILE]
+  config-restore FILE [--apply]
+  sources
+  inspect-data
+  notify-data [--send] [--candidate-list FILE]
+  telegram-queue-worker
+  test-file-send --source ID --file PATH --send
+  test-text-send --source ID [--message TEXT] --send
+  trigger [--source=NAME]
+  retry [--mount]
+  sync [--mount] [--apply-rsync] [--send]
+  image-check [--fix]
+  live-sync [--force] [--fast]
+  fast-sync
+  ultra-fast-sync
+  preview-suspend begin|end|status [TOKEN_OR_REASON]
+  post-trigger
+  watch
+  archive [--apply]
+  health
+  boot-notify [--send]
+  gadget-status
+  gadget-watchdog
+  image-mtime-watch
+  image-watchdog
+  gadget-start [--apply]
+  gadget-stop [disabled]
+
+Standard:
+  No Telegram dispatch.
+  No gadget start.
+  No write rsync.
+  No access to /tmp/motion.lock.
+  No changes to legacy scripts, cron, or rc.local.
+USAGE
+}
+
+ts() { date '+%F %T%z'; }
+
+log() {
+  local level="$1"; shift || true
+  local msg="$*"
+  mkdir -p "$(dirname "$LOG_FILE")" 2>/dev/null || true
+  printf '%s [%s] %s\n' "$(ts)" "$level" "$msg" | tee -a "$LOG_FILE" >&2
+  logger -t vdisk-relay -- "[$level] $msg" 2>/dev/null || true
+}
+
+now_ms() {
+  date +%s%3N 2>/dev/null || python3 - <<'PY'
+import time
+print(int(time.time() * 1000))
+PY
+}
+
+duration_since_ms() {
+  local start="$1" now
+  now="$(now_ms)"
+  if [[ "$start" =~ ^[0-9]+$ ]] && [[ "$now" =~ ^[0-9]+$ ]] && [ "$now" -ge "$start" ]; then
+    printf '%s\n' "$((now - start))"
+  else
+    printf '0\n'
+  fi
+}
+
+trace_new_id() {
+  printf '%s-%s\n' "$(date +%s%N 2>/dev/null || date +%s)" "$$"
+}
+
+pending_value() {
+  local key="$1"
+  [ -r "$RUN_DIR/pending" ] || return 1
+  sed -n "s/^${key}=//p" "$RUN_DIR/pending" 2>/dev/null | head -n1
+}
+
+trace_current_id() {
+  if [ -n "${TRACE_ID:-}" ]; then
+    printf '%s\n' "$TRACE_ID"
+    return 0
+  fi
+  if [ -r "$RUN_DIR/pending" ]; then
+    local current
+    current="$(pending_value trace_id || true)"
+    if [ -n "$current" ]; then
+      printf '%s\n' "$current"
+      return 0
+    fi
+  fi
+  printf 'none\n'
+}
+
+trace_enabled() {
+  [ "${TIMELINE_TRACE_ENABLED:-0}" = "1" ]
+}
+
+trace_event() {
+  trace_enabled || return 0
+  local event="$1"; shift || true
+  local file="${TIMELINE_TRACE_FILE:-/var/log/vdisk-relay-timeline.jsonl}"
+  case "$file" in
+    /*) ;;
+    *) log WARN "timeline trace skipped: TIMELINE_TRACE_FILE is not absolute: $file"; return 0 ;;
+  esac
+
+  mkdir -p "$(dirname "$file")" 2>/dev/null || return 0
+  touch "$file" 2>/dev/null || return 0
+  chmod 600 "$file" 2>/dev/null || true
+
+  TRACE_EVENT_NAME="$event" \
+  TRACE_EVENT_ID="$(trace_current_id)" \
+  TRACE_EVENT_SNAPSHOT="${TIMELINE_TRACE_SYSTEM_SNAPSHOT:-0}" \
+  python3 - "$file" "$@" <<'PY' 2>/dev/null || true
+import json
+import os
+import sys
+from datetime import datetime, timezone
+
+path = sys.argv[1]
+payload = {
+    "ts": datetime.now(timezone.utc).astimezone().isoformat(timespec="milliseconds"),
+    "trace_id": os.environ.get("TRACE_EVENT_ID") or "none",
+    "event": os.environ.get("TRACE_EVENT_NAME") or "unknown",
+}
+
+for raw in sys.argv[2:]:
+    if "=" not in raw:
+        continue
+    key, value = raw.split("=", 1)
+    if not key:
+        continue
+    if value.isdigit():
+        try:
+            payload[key] = int(value)
+            continue
+        except Exception:
+            pass
+    payload[key] = value
+
+if os.environ.get("TRACE_EVENT_SNAPSHOT") == "1":
+    snapshot = {}
+    try:
+        with open("/proc/loadavg", "r", encoding="utf-8") as handle:
+            snapshot["loadavg"] = handle.read().strip().split()[:3]
+    except Exception:
+        pass
+    try:
+        with open("/proc/meminfo", "r", encoding="utf-8") as handle:
+            for line in handle:
+                if line.startswith(("MemAvailable:", "MemFree:", "Buffers:", "Cached:")):
+                    key, rest = line.split(":", 1)
+                    snapshot[key] = rest.strip()
+    except Exception:
+        pass
+    try:
+        read_sectors = 0
+        write_sectors = 0
+        with open("/proc/diskstats", "r", encoding="utf-8") as handle:
+            for line in handle:
+                parts = line.split()
+                if len(parts) < 14:
+                    continue
+                name = parts[2]
+                if name.startswith(("loop", "ram")):
+                    continue
+                read_sectors += int(parts[5])
+                write_sectors += int(parts[9])
+        snapshot["disk_read_sectors"] = read_sectors
+        snapshot["disk_write_sectors"] = write_sectors
+    except Exception:
+        pass
+    payload["system"] = snapshot
+
+with open(path, "a", encoding="utf-8") as handle:
+    json.dump(payload, handle, ensure_ascii=False, separators=(",", ":"))
+    handle.write("\n")
+PY
+}
+
+trace_event_with_pending() {
+  trace_enabled || return 0
+  local event="$1"; shift || true
+  if [ ! -r "$RUN_DIR/pending" ]; then
+    trace_event "$event" "$@" pending_state=absent
+    return 0
+  fi
+
+  local p_source p_trigger_source p_trace_id p_timestamp p_image_mtime p_old_mtime p_new_mtime p_age
+  p_source="$(pending_value source || true)"
+  p_trigger_source="$(pending_value trigger_source || true)"
+  p_trace_id="$(pending_value trace_id || true)"
+  p_timestamp="$(pending_value timestamp || true)"
+  p_image_mtime="$(pending_value image_mtime || true)"
+  p_old_mtime="$(pending_value old_mtime || true)"
+  p_new_mtime="$(pending_value new_mtime || true)"
+  p_age=0
+  if [ -e "$RUN_DIR/pending" ]; then
+    local now pending_mtime
+    now="$(date +%s)"
+    pending_mtime="$(stat -c '%Y' "$RUN_DIR/pending" 2>/dev/null || echo "$now")"
+    p_age=$((now - pending_mtime))
+  fi
+
+  trace_event "$event" "$@" \
+    pending_state=present \
+    pending_source="${p_source:-unknown}" \
+    pending_trigger_source="${p_trigger_source:-${p_source:-unknown}}" \
+    pending_trace_id="${p_trace_id:-none}" \
+    pending_timestamp="${p_timestamp:-}" \
+    pending_image_mtime="${p_image_mtime:-}" \
+    pending_old_mtime="${p_old_mtime:-}" \
+    pending_new_mtime="${p_new_mtime:-}" \
+    pending_age_seconds="$p_age"
+}
+
+live_gate_state_exists() {
+  [ -e /etc/vdisk-relay.live-enabled ] && return 0
+
+  local gate
+  for gate in /etc/vdisk-relay.allow-*; do
+    [ -e "$gate" ] && return 0
+  done
+
+  return 1
+}
+
+config_gate_enabled() {
+  local gate="$1"
+  [ -e /etc/vdisk-relay.live-enabled ] && [ -e "$gate" ]
+}
+
+config_gate_required() {
+  local gate="$1"
+  if live_gate_state_exists; then
+    config_gate_enabled "$gate"
+    return $?
+  fi
+
+  return 0
+}
+
+config_missing_items() {
+  local missing="" entry id enabled pattern last_file bot_var chat_var retries wait tmp_log
+  local enabled_count=0 token chat require_telegram=0 require_archive=0
+
+  if config_gate_required /etc/vdisk-relay.allow-sync \
+    || config_gate_required /etc/vdisk-relay.allow-health-reboot \
+    || config_gate_required /etc/vdisk-relay.allow-boot-notify; then
+    require_telegram=1
+  fi
+
+  if config_gate_required /etc/vdisk-relay.allow-archive; then
+    require_archive=1
+  fi
+
+  if [ "$require_telegram" -eq 1 ]; then
+    if [ "${#SOURCES[@]}" -eq 0 ]; then
+      missing="$missing sources"
+    fi
+
+    for entry in "${SOURCES[@]}"; do
+      [[ "$entry" =~ ^[[:space:]]*# ]] && continue
+      source_parse_entry "$entry"; id="$SRC_ID"; enabled="$SRC_ENABLED"; profile="$SRC_PROFILE"; label="$SRC_LABEL"; pattern="$SRC_MATCH"; extensions="$SRC_EXTENSIONS"; telegram_mode="$SRC_TELEGRAM_MODE"; last_file="$SRC_LAST_FILE"; bot_var="$SRC_BOT_VAR"; chat_var="$SRC_CHAT_VAR"; retries="$SRC_RETRIES"; wait="$SRC_WAIT"; tmp_log="$SRC_TMP_LOG"
+      [ "${enabled:-0}" = "1" ] || continue
+      enabled_count=$((enabled_count + 1))
+
+      [ -n "${id:-}" ] || missing="$missing source-id"
+      [ -n "${pattern:-}" ] || missing="$missing source-pattern:$id"
+      token="${!bot_var:-}"
+      chat="${!chat_var:-}"
+      [ -n "${bot_var:-}" ] && [ -n "$token" ] || missing="$missing bot-token:$id"
+      [ -n "${chat_var:-}" ] && [ -n "$chat" ] || missing="$missing chat-id:$id"
+    done
+
+    if [ "$enabled_count" -eq 0 ]; then
+      missing="$missing active-source"
+    fi
+  fi
+
+  if [ "$require_archive" -eq 1 ]; then
+    [ -n "${ARCHIVE_RSYNC_TARGET:-}" ] || missing="$missing archive-target"
+    [ -r "${ARCHIVE_RSYNC_PASSWORD_FILE:-/nonexistent}" ] || missing="$missing archive-password"
+  fi
+
+  printf '%s\n' "$missing" | xargs
+}
+
+first_telegram_credentials() {
+  local entry id enabled pattern last_file bot_var chat_var retries wait tmp_log token chat
+
+  for entry in "${SOURCES[@]}"; do
+    [[ "$entry" =~ ^[[:space:]]*# ]] && continue
+    source_parse_entry "$entry"; id="$SRC_ID"; enabled="$SRC_ENABLED"; profile="$SRC_PROFILE"; label="$SRC_LABEL"; pattern="$SRC_MATCH"; extensions="$SRC_EXTENSIONS"; telegram_mode="$SRC_TELEGRAM_MODE"; last_file="$SRC_LAST_FILE"; bot_var="$SRC_BOT_VAR"; chat_var="$SRC_CHAT_VAR"; retries="$SRC_RETRIES"; wait="$SRC_WAIT"; tmp_log="$SRC_TMP_LOG"
+    [ "${enabled:-0}" = "1" ] || continue
+    token="${!bot_var:-}"
+    chat="${!chat_var:-}"
+    if [ -n "$token" ] && [ -n "$chat" ]; then
+      printf '%s|%s|%s\n' "$token" "$chat" "$chat_var"
+      return 0
+    fi
+  done
+
+  return 1
+}
+
+
+boot_notify_credentials() {
+  local configured_bot_var configured_chat_var bot_var chat_var token chat
+
+  configured_bot_var="${BOOT_NOTIFY_BOT_VAR:-}"
+  configured_chat_var="${BOOT_NOTIFY_CHAT_VAR:-}"
+
+  if [ -n "$configured_bot_var" ] || [ -n "$configured_chat_var" ]; then
+    if [ -z "$configured_bot_var" ] || [ -z "$configured_chat_var" ]; then
+      log WARN "boot-notify: BOOT_NOTIFY_BOT_VAR/CHAT_VAR are incomplete"
+      return 1
+    fi
+
+    bot_var="$configured_bot_var"
+    chat_var="$configured_chat_var"
+    token="${!bot_var:-}"
+    chat="${!chat_var:-}"
+
+    if [ -n "$token" ] && [ -n "$chat" ]; then
+      printf '%s|%s|%s\n' "$token" "$chat" "$chat_var"
+      return 0
+    fi
+
+    log WARN "boot-notify: configured boot notify variables do not provide token/chat values"
+    return 1
+  fi
+
+  first_telegram_credentials
+}
+
+
+cmd_config_ready() {
+  local missing
+  missing="$(config_missing_items)"
+
+  if [ -z "$missing" ]; then
+    echo "OK config-ready"
+    return 0
+  fi
+
+  echo "MISSING $missing"
+  return 2
+}
+
+fail() {
+  log ERROR "$*"
+  exit 1
+}
+
+require_root() {
+  [ "$(id -u)" -eq 0 ] || fail "This command must run as root."
+}
+
+ensure_dirs() {
+  mkdir -p "$RUN_DIR" "$STATE_DIR" "$STATE_DIR/last" "$STATE_DIR/shadow" "$MOUNTPOINT" "$DATA_ROOT" "$PREVIEW_DIR"
+  mkdir -p \
+    "$STATE_DIR/telegram-queue" \
+    "$STATE_DIR/telegram-queue/pending" \
+    "$STATE_DIR/telegram-queue/processing" \
+    "$STATE_DIR/telegram-queue/done" \
+    "$STATE_DIR/telegram-queue/failed"
+  chmod 700 \
+    "$RUN_DIR" \
+    "$STATE_DIR" \
+    "$STATE_DIR/last" \
+    "$STATE_DIR/shadow" \
+    "$STATE_DIR/telegram-queue" \
+    "$STATE_DIR/telegram-queue/pending" \
+    "$STATE_DIR/telegram-queue/processing" \
+    "$STATE_DIR/telegram-queue/done" \
+    "$STATE_DIR/telegram-queue/failed" \
+    "$DATA_ROOT" \
+    "$PREVIEW_DIR" \
+    2>/dev/null || true
+}
+
+module_loaded() {
+  local mod="$1"
+  awk '{print $1}' /proc/modules 2>/dev/null | grep -Fxq "$mod"
+}
+
+is_mounted() {
+  mountpoint -q "$1"
+}
+
+int_value_or_default() {
+  local value="$1"
+  local default="$2"
+  local min="$3"
+  local max="$4"
+
+  [[ "$value" =~ ^[0-9]+$ ]] || value="$default"
+  [ "$value" -lt "$min" ] && value="$min"
+  if [ -n "$max" ] && [ "$value" -gt "$max" ]; then
+    value="$max"
+  fi
+  printf '%s\n' "$value"
+}
+
+latest_child_dir() {
+  local parent="${1%/}"
+  [ -d "$parent" ] || return 1
+  local latest
+  latest="$(ls -1dt -- "$parent"/*/ 2>/dev/null | head -n1 || true)"
+  [ -n "$latest" ] || return 1
+  printf '%s\n' "$latest"
+}
+
+latest_blink_dir_for_root() {
+  local root="${1%/}"
+  local month day
+  month="$(latest_child_dir "$root/blink")" || return 1
+  day="$(latest_child_dir "$month")" || return 1
+  printf '%s\n' "$day"
+}
+
+latest_file_matching() {
+  local dir="$1"
+  local pattern="$2"
+  local extensions="${3:-*}"
+  [ -d "$dir" ] || return 1
+  local line file
+  while IFS= read -r line; do
+    file="${line#* }"
+    [ -f "$file" ] || continue
+    path_matches_source_pattern "$file" "$pattern" || continue
+    file_extension_allowed "$file" "$extensions" || continue
+    printf '%s\n' "$file"
+    return 0
+  done < <(find "$dir" -type f -printf '%T@ %p\n' 2>/dev/null | sort -nr)
+  return 1
+}
+
+is_uint() {
+  [[ "${1:-}" =~ ^[0-9]+$ ]]
+}
+
+source_send_baseline_mtime() {
+  local id="$1" last_file="${2:-}" state_file mtime
+  state_file="$(send_state_file "$id")"
+  mtime="$(send_state_value "$state_file" mtime 2>/dev/null || true)"
+  if is_uint "$mtime"; then
+    printf '%s\n' "$mtime"
+    return 0
+  fi
+
+  if [ -n "$last_file" ] && [ -f "$last_file" ]; then
+    mtime="$(stat -c '%Y' "$last_file" 2>/dev/null || true)"
+    if is_uint "$mtime"; then
+      printf '%s\n' "$mtime"
+      return 0
+    fi
+  fi
+
+  return 1
+}
+
+safe_relative_path() {
+  local rel="$1"
+  case "$rel" in
+    ""|/*|..|../*|*/../*|*/..)
+      return 1
+      ;;
+  esac
+  return 0
+}
+
+path_matches_source_pattern() {
+  local file="$1" pattern="$2" rel base
+  [ -n "$file" ] && [ -n "$pattern" ] || return 1
+  [ "$pattern" = "*" ] && return 0
+  rel="$(file_rel_path "$file")"
+  base="$(basename "$file")"
+  printf '%s\n' "$base" | grep -Fq -- "$pattern" && return 0
+  printf '%s\n' "$rel" | grep -Fq -- "$pattern"
+}
+
+file_extension() {
+  local name ext
+  name="$(basename "${1:-}")"
+  case "$name" in
+    *.*) ext="${name##*.}" ;;
+    *) ext="" ;;
+  esac
+  printf '%s\n' "$(printf '%s' "$ext" | tr '[:upper:]' '[:lower:]')"
+}
+
+file_extension_allowed() {
+  local file="$1" extensions="${2:-*}" ext item lowered
+  [ -n "$file" ] || return 1
+  lowered="$(printf '%s' "$extensions" | tr '[:upper:]' '[:lower:]' | tr ';' ',')"
+  lowered="${lowered// /}"
+  [ -n "$lowered" ] || lowered="*"
+  [ "$lowered" = "*" ] && return 0
+  ext="$(file_extension "$file")"
+  [ -n "$ext" ] || return 1
+  IFS=',' read -r -a _source_ext_items <<< "$lowered"
+  for item in "${_source_ext_items[@]}"; do
+    [ "$item" = "*" ] && return 0
+    [ "$item" = "$ext" ] && return 0
+  done
+  return 1
+}
+
+media_type_for_file() {
+  local ext
+  ext="$(file_extension "$1")"
+  case "$ext" in
+    mp4|mov|m4v|avi|mkv|webm) printf 'video\n' ;;
+    jpg|jpeg|png|gif|webp|bmp) printf 'image\n' ;;
+    mp3|wav|m4a|aac|flac|ogg) printf 'audio\n' ;;
+    txt|log|json|csv|md|xml|yaml|yml) printf 'text\n' ;;
+    pdf|zip|tar|gz|tgz|7z|rar|doc|docx|xls|xlsx) printf 'document\n' ;;
+    *) printf 'other\n' ;;
+  esac
+}
+
+telegram_method_for_file() {
+  local mode="${1:-auto}" file="$2" media_type
+  media_type="$(media_type_for_file "$file")"
+  case "$mode" in
+    video) printf 'sendVideo|video\n' ;;
+    photo) printf 'sendPhoto|photo\n' ;;
+    audio) printf 'sendAudio|audio\n' ;;
+    document) printf 'sendDocument|document\n' ;;
+    auto|"")
+      case "$media_type" in
+        video) printf 'sendVideo|video\n' ;;
+        image) printf 'sendPhoto|photo\n' ;;
+        audio) printf 'sendAudio|audio\n' ;;
+        *) printf 'sendDocument|document\n' ;;
+      esac
+      ;;
+    *) printf 'sendDocument|document\n' ;;
+  esac
+}
+
+source_parse_entry() {
+  local entry="$1"
+  SRC_ID=""
+  SRC_ENABLED="0"
+  SRC_PROFILE="blink-security-video"
+  SRC_LABEL=""
+  SRC_MATCH="*"
+  SRC_EXTENSIONS="mp4"
+  SRC_TELEGRAM_MODE="video"
+  SRC_TIME_MODE="blink-utc"
+  SRC_SOURCE_TIMEZONE="UTC"
+  SRC_DISPLAY_TIMEZONE="Europe/Berlin"
+  SRC_LAST_FILE=""
+  SRC_BOT_VAR=""
+  SRC_CHAT_VAR=""
+  SRC_RETRIES="4"
+  SRC_WAIT="3"
+  SRC_TMP_LOG="$RUN_DIR/telegram-response.json"
+
+  IFS='|' read -r \
+    SRC_ID SRC_ENABLED SRC_PROFILE SRC_LABEL SRC_MATCH SRC_EXTENSIONS SRC_TELEGRAM_MODE SRC_TIME_MODE \
+    SRC_SOURCE_TIMEZONE SRC_DISPLAY_TIMEZONE SRC_LAST_FILE SRC_BOT_VAR SRC_CHAT_VAR SRC_RETRIES SRC_WAIT SRC_TMP_LOG \
+    <<< "$entry"
+
+  [ -n "$SRC_PROFILE" ] || SRC_PROFILE="blink-security-video"
+  [ -n "$SRC_LABEL" ] || SRC_LABEL="$SRC_ID"
+  [ -n "$SRC_MATCH" ] || SRC_MATCH="*"
+  [ -n "$SRC_EXTENSIONS" ] || SRC_EXTENSIONS="mp4"
+  [ -n "$SRC_TELEGRAM_MODE" ] || SRC_TELEGRAM_MODE="auto"
+  [ -n "$SRC_TIME_MODE" ] || SRC_TIME_MODE="mtime"
+  [ -n "$SRC_SOURCE_TIMEZONE" ] || SRC_SOURCE_TIMEZONE="UTC"
+  [ -n "$SRC_DISPLAY_TIMEZONE" ] || SRC_DISPLAY_TIMEZONE="Europe/Berlin"
+  [ -n "$SRC_RETRIES" ] || SRC_RETRIES="4"
+  [ -n "$SRC_WAIT" ] || SRC_WAIT="3"
+  [ -n "$SRC_TMP_LOG" ] || SRC_TMP_LOG="$RUN_DIR/${SRC_ID:-source}.telegram-response.json"
+}
+
+source_latest_dir_for_root() {
+  local root="$1" profile="$2"
+  if [ "$profile" = "blink-security-video" ] && [ -d "${root%/}/blink" ]; then
+    latest_blink_dir_for_root "$root" && return 0
+  fi
+  [ -d "$root" ] || return 1
+  printf '%s\n' "${root%/}"
+}
+
+latest_candidate_matching() {
+  local candidate_list="$1" pattern="$2"
+  local extensions="${3:-*}"
+  local candidate best="" best_mtime=-1 mtime
+  [ -r "$candidate_list" ] || return 1
+
+  while IFS= read -r candidate; do
+    [ -f "$candidate" ] || continue
+    path_matches_source_pattern "$candidate" "$pattern" || continue
+    file_extension_allowed "$candidate" "$extensions" || continue
+    mtime="$(stat -c '%Y' "$candidate" 2>/dev/null || echo 0)"
+    [ "$mtime" -gt 0 ] || continue
+    if [ "$mtime" -ge "$best_mtime" ]; then
+      best_mtime="$mtime"
+      best="$candidate"
+    fi
+  done < "$candidate_list"
+
+  [ -n "$best" ] || return 1
+  printf '%s\n' "$best"
+}
+
+rsync_output_to_candidates() {
+  local out_file="$1" candidates_file="$2" source_root="$3" target_root="$4"
+  local line rel source target candidate tmp
+
+  tmp="${candidates_file}.tmp.$$"
+  : > "$tmp" || return 1
+
+  while IFS= read -r line; do
+    case "$line" in
+      vdisk-relay-rsync:*) rel="${line#vdisk-relay-rsync:}" ;;
+      *) continue ;;
+    esac
+
+    rel="${rel#./}"
+    safe_relative_path "$rel" || {
+      log WARN "rsync candidate ignored unsafe rel=$rel"
+      continue
+    }
+
+    source="${source_root%/}/$rel"
+    target="${target_root%/}/$rel"
+    candidate=""
+
+    if [ -f "$target" ]; then
+      candidate="$target"
+    elif [ -f "$source" ]; then
+      candidate="$source"
+    fi
+
+    [ -n "$candidate" ] || continue
+    printf '%s\n' "$candidate" >> "$tmp"
+  done < "$out_file"
+
+  if [ -s "$tmp" ]; then
+    sort -u "$tmp" > "$candidates_file"
+  else
+    : > "$candidates_file"
+  fi
+  rm -f "$tmp"
+}
+
+line_count() {
+  local file="$1"
+  [ -s "$file" ] || {
+    printf '0\n'
+    return 0
+  }
+  wc -l < "$file" | tr -d '[:space:]'
+}
+
+send_state_id() {
+  local id="$1" safe
+  safe="$(printf '%s' "$id" | tr -c 'A-Za-z0-9_-' '_')"
+  [ -n "$safe" ] || safe="unknown"
+  printf '%s\n' "$safe"
+}
+
+send_state_file() {
+  local id="$1"
+  printf '%s/last/%s.send-state\n' "$STATE_DIR" "$(send_state_id "$id")"
+}
+
+file_rel_path() {
+  local file="$1"
+  case "$file" in
+    "$DATA_ROOT"/*) printf '%s\n' "${file#"$DATA_ROOT"/}" ;;
+    "$MOUNTPOINT"/*) printf '%s\n' "${file#"$MOUNTPOINT"/}" ;;
+    *) printf '%s\n' "$file" ;;
+  esac
+}
+
+send_state_value() {
+  local state_file="$1" key="$2"
+  [ -r "$state_file" ] || return 1
+  sed -n "s/^${key}=//p" "$state_file" 2>/dev/null | head -n1
+}
+
+candidate_matches_send_state_strict() {
+  local id="$1" candidate="$2" state_file rel size mtime state_rel state_size state_mtime
+  state_file="$(send_state_file "$id")"
+  [ -r "$state_file" ] || return 1
+  [ -f "$candidate" ] || return 1
+
+  rel="$(file_rel_path "$candidate")"
+  size="$(stat -c '%s' "$candidate" 2>/dev/null || true)"
+  mtime="$(stat -c '%Y' "$candidate" 2>/dev/null || true)"
+  [ -n "$size" ] && [ -n "$mtime" ] || return 1
+
+  state_rel="$(send_state_value "$state_file" file_rel || true)"
+  state_size="$(send_state_value "$state_file" size || true)"
+  state_mtime="$(send_state_value "$state_file" mtime || true)"
+
+  [ "$rel" = "$state_rel" ] && [ "$size" = "$state_size" ] && [ "$mtime" = "$state_mtime" ]
+}
+
+candidate_matches_send_state_filename() {
+  local id="$1" candidate="$2" state_file rel state_rel state_base candidate_base
+  state_file="$(send_state_file "$id")"
+  [ -r "$state_file" ] || return 1
+  [ -f "$candidate" ] || return 1
+
+  rel="$(file_rel_path "$candidate")"
+  candidate_base="$(basename "$rel")"
+  state_rel="$(send_state_value "$state_file" file_rel || true)"
+  state_base="$(send_state_value "$state_file" basename || true)"
+  [ -n "$state_base" ] || state_base="$(basename "$state_rel")"
+
+  [ -n "$candidate_base" ] && [ "$candidate_base" = "$state_base" ]
+}
+
+candidate_matches_send_state_mode() {
+  local id="$1" candidate="$2" mode="${3:-strict}"
+  case "$mode" in
+    off) return 1 ;;
+    filename) candidate_matches_send_state_filename "$id" "$candidate" ;;
+    strict|*) candidate_matches_send_state_strict "$id" "$candidate" ;;
+  esac
+}
+
+candidate_matches_send_state() {
+  local id="$1" candidate="$2" state_file mode
+  state_file="$(send_state_file "$id")"
+  [ -r "$state_file" ] || return 1
+  mode="$(send_state_value "$state_file" duplicate_mode || true)"
+  [ -n "$mode" ] || mode="strict"
+  candidate_matches_send_state_mode "$id" "$candidate" "$mode"
+}
+
+ultra_queue_add_candidate() {
+  local queue_file="$1" candidate="$2" id="$3" last_file="$4" bot_var="$5" chat_var="$6" retries="$7" wait="$8" tmp_log="$9" telegram_mode="${10:-auto}"
+  local mtime
+  [ -f "$candidate" ] || return 1
+  mtime="$(stat -c '%Y' "$candidate" 2>/dev/null || true)"
+  is_uint "$mtime" || return 1
+  printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|%s\n' "$mtime" "$candidate" "$id" "$last_file" "$bot_var" "$chat_var" "$retries" "$wait" "$tmp_log" "$telegram_mode" >> "$queue_file"
+}
+
+ultra_collect_source_queue() {
+  local latest_dir="$1" id="$2" pattern="$3" extensions="$4" telegram_mode="$5" last_file="$6" bot_var="$7" chat_var="$8" retries="$9" wait="${10}" tmp_log="${11}" mode="${12}" queue_file="${13}" skipped_file="${14}"
+  local baseline candidate file candidate_mtime latest_candidate
+
+  if ! baseline="$(source_send_baseline_mtime "$id" "$last_file")"; then
+    latest_candidate="$(latest_file_matching "$latest_dir" "$pattern" "$extensions" 2>/dev/null || true)"
+    if [ -n "$latest_candidate" ]; then
+      log WARN "ultra-fast-sync: source=$id without send baseline, queue limited to newest candidate"
+      trace_event ultra_queue_no_baseline source=ultra-fast-sync source_id="$id" file="$latest_candidate"
+      ultra_queue_add_candidate "$queue_file" "$latest_candidate" "$id" "$last_file" "$bot_var" "$chat_var" "$retries" "$wait" "$tmp_log" "$telegram_mode" || true
+    else
+      log INFO "ultra-fast-sync: source=$id pattern=$pattern candidate=NONE"
+      trace_event candidate_missing source=ultra-fast-sync source_id="$id" pattern="$pattern"
+    fi
+    return 0
+  fi
+
+  while IFS= read -r file; do
+    [ -n "$file" ] || continue
+    candidate="${latest_dir%/}/$file"
+    [ -f "$candidate" ] || continue
+    path_matches_source_pattern "$candidate" "$pattern" || continue
+    file_extension_allowed "$candidate" "$extensions" || continue
+
+    candidate_mtime="$(stat -c '%Y' "$candidate" 2>/dev/null || true)"
+    is_uint "$candidate_mtime" || continue
+    [ "$candidate_mtime" -le "$baseline" ] && continue
+
+    if candidate_matches_send_state_mode "$id" "$candidate" "$mode"; then
+      printf '%s|%s|%s\n' "$candidate_mtime" "$candidate" "$id" >> "$skipped_file"
+      log INFO "ultra-fast-sync: source=$id candidate=$(basename "$candidate") duplicate_mode=$mode state=already-sent"
+      trace_event ultra_duplicate_skip source=ultra-fast-sync source_id="$id" file="$candidate" duplicate_mode="$mode"
+      continue
+    fi
+
+    ultra_queue_add_candidate "$queue_file" "$candidate" "$id" "$last_file" "$bot_var" "$chat_var" "$retries" "$wait" "$tmp_log" "$telegram_mode" || true
+  done < <(
+    find "$latest_dir" -type f -printf '%P\n' 2>/dev/null \
+      | if [ -n "$pattern" ] && [ "$pattern" != "*" ]; then grep -F -- "$pattern"; else cat; fi
+  )
+}
+
+legacy_last_copy_matches_candidate() {
+  local last_file="$1" candidate="$2" last_size candidate_size last_mtime candidate_mtime
+  [ -n "${last_file:-}" ] && [ -f "$last_file" ] || return 1
+  [ -f "$candidate" ] || return 1
+
+  last_size="$(stat -c '%s' "$last_file" 2>/dev/null || true)"
+  candidate_size="$(stat -c '%s' "$candidate" 2>/dev/null || true)"
+  last_mtime="$(stat -c '%Y' "$last_file" 2>/dev/null || true)"
+  candidate_mtime="$(stat -c '%Y' "$candidate" 2>/dev/null || true)"
+  [ -n "$last_size" ] && [ -n "$candidate_size" ] && [ -n "$last_mtime" ] && [ -n "$candidate_mtime" ] || return 1
+
+  [ "$last_size" = "$candidate_size" ] && [ "$last_mtime" -ge "$candidate_mtime" ]
+}
+
+write_send_state() {
+  local id="$1" candidate="$2" source="${3:-send-ok}" legacy_last_file="${4:-}" duplicate_mode="${5:-strict}"
+  local state_file tmp rel size mtime sent_at base
+
+  [ -f "$candidate" ] || return 1
+  state_file="$(send_state_file "$id")"
+  rel="$(file_rel_path "$candidate")"
+  base="$(basename "$rel")"
+  size="$(stat -c '%s' "$candidate" 2>/dev/null || true)"
+  mtime="$(stat -c '%Y' "$candidate" 2>/dev/null || true)"
+  [ -n "$size" ] && [ -n "$mtime" ] || return 1
+
+  mkdir -p "$(dirname "$state_file")"
+  chmod 700 "$(dirname "$state_file")" 2>/dev/null || true
+  sent_at="$(date --iso-8601=seconds)"
+  tmp="${state_file}.tmp.$$"
+
+  {
+    printf 'source=%s\n' "$id"
+    printf 'file_rel=%s\n' "$rel"
+    printf 'basename=%s\n' "$base"
+    printf 'size=%s\n' "$size"
+    printf 'mtime=%s\n' "$mtime"
+    printf 'sent_at=%s\n' "$sent_at"
+    printf 'source=%s\n' "$source"
+    printf 'duplicate_mode=%s\n' "$duplicate_mode"
+    printf 'candidate=%s\n' "$candidate"
+    printf 'legacy_last_file=%s\n' "$legacy_last_file"
+  } > "$tmp" || return 1
+
+  chmod 600 "$tmp" 2>/dev/null || true
+  mv -f "$tmp" "$state_file"
+}
+
+telegram_queue_dir() {
+  printf '%s/telegram-queue\n' "$STATE_DIR"
+}
+
+telegram_queue_state_dir() {
+  local state="$1"
+  printf '%s/%s\n' "$(telegram_queue_dir)" "$state"
+}
+
+telegram_queue_job_id() {
+  local id="$1" candidate="$2" rel size mtime digest safe
+
+  [ -f "$candidate" ] || return 1
+  rel="$(file_rel_path "$candidate")"
+  size="$(stat -c '%s' "$candidate" 2>/dev/null || true)"
+  mtime="$(stat -c '%Y' "$candidate" 2>/dev/null || true)"
+  [ -n "$size" ] && [ -n "$mtime" ] || return 1
+
+  if command -v sha1sum >/dev/null 2>&1; then
+    digest="$(printf '%s|%s|%s|%s\n' "$id" "$rel" "$size" "$mtime" | sha1sum | awk '{print $1}')"
+  else
+    digest="$(printf '%s|%s|%s|%s\n' "$id" "$rel" "$size" "$mtime" | cksum | awk '{print $1 "-" $2}')"
+  fi
+  safe="$(send_state_id "$id")"
+  printf '%s-%s\n' "$safe" "$digest"
+}
+
+telegram_queue_job_exists() {
+  local job_id="$1" state
+  for state in pending processing done failed; do
+    [ -e "$(telegram_queue_state_dir "$state")/${job_id}.json" ] && return 0
+  done
+  return 1
+}
+
+telegram_queue_enqueue_job() {
+  local id="$1" candidate="$2" legacy_last_file="$3" bot_var="$4" chat_var="$5" retries="$6" wait="$7" tmp_log="$8" source="$9" telegram_mode="${10:-auto}"
+  local job_id job_file tmp rel size mtime created_epoch created_at trace_id media_type
+
+  [ -f "$candidate" ] || return 1
+  ensure_dirs
+
+  job_id="$(telegram_queue_job_id "$id" "$candidate")" || return 1
+  if telegram_queue_job_exists "$job_id"; then
+    log INFO "QUEUE-SKIP source=$id job=$job_id file=$(basename "$candidate") state=already-present"
+    return 0
+  fi
+
+  rel="$(file_rel_path "$candidate")"
+  size="$(stat -c '%s' "$candidate" 2>/dev/null || true)"
+  mtime="$(stat -c '%Y' "$candidate" 2>/dev/null || true)"
+  media_type="$(media_type_for_file "$candidate")"
+  created_epoch="$(date +%s)"
+  created_at="$(date --iso-8601=seconds)"
+  trace_id=""
+  trace_enabled && trace_id="$(trace_current_id)"
+  job_file="$(telegram_queue_state_dir pending)/${job_id}.json"
+  tmp="${job_file}.tmp.$$"
+
+  QUEUE_JOB_ID="$job_id" \
+  QUEUE_SOURCE_ID="$id" \
+  QUEUE_PATH="$candidate" \
+  QUEUE_FILE_REL="$rel" \
+  QUEUE_BASENAME="$(basename "$candidate")" \
+  QUEUE_SIZE="$size" \
+  QUEUE_MTIME="$mtime" \
+  QUEUE_CREATED_EPOCH="$created_epoch" \
+  QUEUE_CREATED_AT="$created_at" \
+  QUEUE_LEGACY_LAST_FILE="$legacy_last_file" \
+  QUEUE_BOT_VAR="$bot_var" \
+  QUEUE_CHAT_VAR="$chat_var" \
+  QUEUE_RETRIES="$retries" \
+  QUEUE_WAIT="$wait" \
+  QUEUE_TMP_LOG="$tmp_log" \
+  QUEUE_SOURCE="$source" \
+  QUEUE_TELEGRAM_MODE="$telegram_mode" \
+  QUEUE_MEDIA_TYPE="$media_type" \
+  QUEUE_TRACE_ID="$trace_id" \
+  python3 - "$tmp" <<'PY' || return 1
+import json
+import os
+import sys
+
+def value(name, default=""):
+    return os.environ.get(name, default)
+
+def number(name, default=0):
+    try:
+        return int(str(value(name, default)).strip())
+    except Exception:
+        return int(default)
+
+payload = {
+    "job_id": value("QUEUE_JOB_ID"),
+    "source_id": value("QUEUE_SOURCE_ID"),
+    "path": value("QUEUE_PATH"),
+    "file": value("QUEUE_PATH"),
+    "file_rel": value("QUEUE_FILE_REL"),
+    "media_type": value("QUEUE_MEDIA_TYPE"),
+    "telegram_mode": value("QUEUE_TELEGRAM_MODE", "auto"),
+    "basename": value("QUEUE_BASENAME"),
+    "size": number("QUEUE_SIZE", 0),
+    "mtime": number("QUEUE_MTIME", 0),
+    "created_epoch": number("QUEUE_CREATED_EPOCH", 0),
+    "created_at": value("QUEUE_CREATED_AT"),
+    "updated_at": value("QUEUE_CREATED_AT"),
+    "next_attempt_epoch": number("QUEUE_CREATED_EPOCH", 0),
+    "next_attempt_at": value("QUEUE_CREATED_AT"),
+    "attempts": 0,
+    "status": "pending",
+    "trace_id": value("QUEUE_TRACE_ID"),
+    "source": value("QUEUE_SOURCE"),
+    "legacy_last_file": value("QUEUE_LEGACY_LAST_FILE"),
+    "bot_var": value("QUEUE_BOT_VAR"),
+    "chat_var": value("QUEUE_CHAT_VAR"),
+    "retries": number("QUEUE_RETRIES", 0),
+    "wait": number("QUEUE_WAIT", 0),
+    "tmp_log": value("QUEUE_TMP_LOG"),
+    "last_error": "",
+}
+with open(sys.argv[1], "w", encoding="utf-8") as handle:
+    json.dump(payload, handle, ensure_ascii=False, indent=2, sort_keys=True)
+    handle.write("\n")
+PY
+
+  chmod 600 "$tmp" 2>/dev/null || true
+  mv -f "$tmp" "$job_file"
+  log INFO "QUEUE-ENQUEUED source=$id job=$job_id source=$source file=$candidate"
+  trace_event queue_enqueued source=notify-data source_id="$id" job="$job_id" file="$candidate" candidate_source="$source" size="$size"
+}
+
+telegram_queue_start_worker_async() {
+  command -v systemctl >/dev/null 2>&1 || return 0
+  trace_event queue_worker_start_requested source=notify-data unit=vdisk-relay-telegram-queue.service
+  systemctl start --no-block vdisk-relay-telegram-queue.service >/dev/null 2>&1 || true
+}
+
+telegram_queue_job_exports() {
+  local job_file="$1"
+  python3 - "$job_file" <<'PY'
+import json
+import shlex
+import sys
+
+try:
+    with open(sys.argv[1], "r", encoding="utf-8") as handle:
+        payload = json.load(handle)
+except Exception as exc:
+    print("QUEUE_CORRUPT=1")
+    print("QUEUE_LAST_ERROR=" + shlex.quote(str(exc)[:500]))
+    raise SystemExit(0)
+
+fields = {
+    "QUEUE_CORRUPT": "0",
+    "QUEUE_JOB_ID": payload.get("job_id", ""),
+    "QUEUE_TRACE_ID": payload.get("trace_id", ""),
+    "QUEUE_SOURCE_ID": payload.get("source_id") or "",
+    "QUEUE_PATH": payload.get("path") or payload.get("file") or "",
+    "QUEUE_LEGACY_LAST_FILE": payload.get("legacy_last_file", ""),
+    "QUEUE_BOT_VAR": payload.get("bot_var", ""),
+    "QUEUE_CHAT_VAR": payload.get("chat_var", ""),
+    "QUEUE_TELEGRAM_MODE": payload.get("telegram_mode", "auto"),
+    "QUEUE_RETRIES": payload.get("retries", 0),
+    "QUEUE_WAIT": payload.get("wait", 0),
+    "QUEUE_TMP_LOG": payload.get("tmp_log", ""),
+    "QUEUE_ATTEMPTS": payload.get("attempts", 0),
+    "QUEUE_NEXT_ATTEMPT_EPOCH": payload.get("next_attempt_epoch", 0),
+    "QUEUE_LAST_ERROR": payload.get("last_error", ""),
+}
+for key, value in fields.items():
+    print(f"{key}={shlex.quote(str(value))}")
+PY
+}
+
+telegram_queue_update_processing_job() {
+  local job_file="$1" attempts="$2" error="${3:-}" next_epoch="${4:-}"
+  local tmp="${job_file}.tmp.$$"
+
+  QUEUE_ATTEMPTS="$attempts" \
+  QUEUE_LAST_ERROR="$error" \
+  QUEUE_NEXT_EPOCH="$next_epoch" \
+  QUEUE_UPDATED_AT="$(date --iso-8601=seconds)" \
+  python3 - "$job_file" "$tmp" <<'PY' || return 1
+import datetime as dt
+import json
+import os
+import sys
+
+src, dst = sys.argv[1], sys.argv[2]
+with open(src, "r", encoding="utf-8") as handle:
+    payload = json.load(handle)
+
+payload["attempts"] = int(os.environ.get("QUEUE_ATTEMPTS", "0") or 0)
+payload["updated_at"] = os.environ.get("QUEUE_UPDATED_AT", "")
+payload["status"] = "processing"
+error = os.environ.get("QUEUE_LAST_ERROR", "")
+if error:
+    payload["last_error"] = error[:500]
+next_epoch = os.environ.get("QUEUE_NEXT_EPOCH", "")
+if next_epoch:
+    epoch = int(next_epoch)
+    payload["next_attempt_epoch"] = epoch
+    payload["next_attempt_at"] = dt.datetime.fromtimestamp(epoch, dt.timezone.utc).astimezone().isoformat()
+
+with open(dst, "w", encoding="utf-8") as handle:
+    json.dump(payload, handle, ensure_ascii=False, indent=2, sort_keys=True)
+    handle.write("\n")
+PY
+
+  chmod 600 "$tmp" 2>/dev/null || true
+  mv -f "$tmp" "$job_file"
+}
+
+telegram_queue_move_processing_job() {
+  local job_file="$1" target_state="$2" status="$3" error="${4:-}" next_epoch="${5:-}"
+  local target_dir target_file tmp
+  target_dir="$(telegram_queue_state_dir "$target_state")"
+  mkdir -p "$target_dir"
+  target_file="$target_dir/$(basename "$job_file")"
+  tmp="${target_file}.tmp.$$"
+
+  QUEUE_TARGET_STATE="$target_state" \
+  QUEUE_STATUS="$status" \
+  QUEUE_LAST_ERROR="$error" \
+  QUEUE_NEXT_EPOCH="$next_epoch" \
+  QUEUE_UPDATED_AT="$(date --iso-8601=seconds)" \
+  python3 - "$job_file" "$tmp" <<'PY' || return 1
+import datetime as dt
+import json
+import os
+import sys
+
+src, dst = sys.argv[1], sys.argv[2]
+try:
+    with open(src, "r", encoding="utf-8") as handle:
+        payload = json.load(handle)
+except Exception:
+    payload = {"job_id": os.path.basename(src), "last_error": "corrupt job file"}
+
+target_state = os.environ.get("QUEUE_TARGET_STATE", "")
+status = os.environ.get("QUEUE_STATUS", target_state)
+updated_at = os.environ.get("QUEUE_UPDATED_AT", "")
+payload["status"] = status
+payload["updated_at"] = updated_at
+payload[target_state + "_at"] = updated_at
+error = os.environ.get("QUEUE_LAST_ERROR", "")
+if error:
+    payload["last_error"] = error[:500]
+elif target_state == "done":
+    payload["last_error"] = ""
+next_epoch = os.environ.get("QUEUE_NEXT_EPOCH", "")
+if next_epoch:
+    epoch = int(next_epoch)
+    payload["next_attempt_epoch"] = epoch
+    payload["next_attempt_at"] = dt.datetime.fromtimestamp(epoch, dt.timezone.utc).astimezone().isoformat()
+
+with open(dst, "w", encoding="utf-8") as handle:
+    json.dump(payload, handle, ensure_ascii=False, indent=2, sort_keys=True)
+    handle.write("\n")
+PY
+
+  chmod 600 "$tmp" 2>/dev/null || true
+  mv -f "$tmp" "$target_file"
+  [ "$target_file" = "$job_file" ] || rm -f "$job_file"
+}
+
+telegram_queue_error_detail() {
+  local rc="$1" tmp_log="${2:-}" detail response
+  detail="rc=$rc"
+  if [ -n "$tmp_log" ] && [ -r "$tmp_log" ]; then
+    response="$(tr -d '\r\n' < "$tmp_log" 2>/dev/null | head -c 420 || true)"
+    [ -n "$response" ] && detail="$detail response=$response"
+  fi
+  printf '%s\n' "$detail" | head -c 500
+}
+
+telegram_queue_recover_processing() {
+  local processing_dir job now
+  processing_dir="$(telegram_queue_state_dir processing)"
+  now="$(date +%s)"
+  for job in "$processing_dir"/*.json; do
+    [ -e "$job" ] || continue
+    telegram_queue_move_processing_job "$job" pending pending "recovered after interrupted processing" "$now" || true
+  done
+}
+
+telegram_queue_prune_done() {
+  local done_dir max
+  done_dir="$(telegram_queue_state_dir done)"
+  max="$(int_value_or_default "${TELEGRAM_QUEUE_DONE_MAX_FILES:-200}" "200" "0" "5000")"
+  [ "$max" -gt 0 ] || return 0
+  [ -d "$done_dir" ] || return 0
+  find "$done_dir" -type f -name '*.json' -printf '%T@ %p\n' 2>/dev/null \
+    | sort -rn \
+    | awk -v max="$max" 'NR > max { sub(/^[^ ]+ /, ""); print }' \
+    | while IFS= read -r stale; do
+        [ -n "$stale" ] && rm -f "$stale"
+      done
+}
+
+cmd_telegram_queue_worker() {
+  require_root
+  ensure_dirs
+  trace_event queue_worker_started source=telegram-queue
+
+  if [ "${TELEGRAM_QUEUE_ENABLED:-1}" != "1" ]; then
+    log INFO "telegram queue disabled"
+    return 0
+  fi
+
+  local lock="$RUN_DIR/telegram-queue.lock"
+  exec 9>"$lock"
+  if ! flock -n 9; then
+    log INFO "telegram queue worker already running"
+    return 0
+  fi
+
+  telegram_queue_recover_processing
+
+  local pending_dir processing_dir limit processed now job_file processing_file
+  pending_dir="$(telegram_queue_state_dir pending)"
+  processing_dir="$(telegram_queue_state_dir processing)"
+  limit="$(int_value_or_default "${TELEGRAM_QUEUE_PROCESS_LIMIT:-2}" "2" "1" "20")"
+  processed=0
+
+  for job_file in "$pending_dir"/*.json; do
+    [ -e "$job_file" ] || continue
+    [ "$processed" -lt "$limit" ] || break
+
+    unset QUEUE_CORRUPT QUEUE_JOB_ID QUEUE_SOURCE_ID QUEUE_PATH QUEUE_LEGACY_LAST_FILE
+    unset QUEUE_BOT_VAR QUEUE_CHAT_VAR QUEUE_TELEGRAM_MODE QUEUE_RETRIES QUEUE_WAIT QUEUE_TMP_LOG QUEUE_ATTEMPTS
+    unset QUEUE_NEXT_ATTEMPT_EPOCH QUEUE_LAST_ERROR QUEUE_TRACE_ID
+    eval "$(telegram_queue_job_exports "$job_file")"
+
+    if [ "${QUEUE_CORRUPT:-0}" = "1" ]; then
+      processing_file="$processing_dir/$(basename "$job_file")"
+      mv -f "$job_file" "$processing_file" 2>/dev/null || continue
+      telegram_queue_move_processing_job "$processing_file" failed failed "${QUEUE_LAST_ERROR:-corrupt job file}" || true
+      processed=$((processed + 1))
+      continue
+    fi
+
+    now="$(date +%s)"
+    if [[ "${QUEUE_NEXT_ATTEMPT_EPOCH:-0}" =~ ^[0-9]+$ ]] && [ "${QUEUE_NEXT_ATTEMPT_EPOCH:-0}" -gt "$now" ]; then
+      continue
+    fi
+
+    processing_file="$processing_dir/$(basename "$job_file")"
+    mv -f "$job_file" "$processing_file" 2>/dev/null || continue
+
+    local attempts token chat rc next_epoch max_attempts error retries wait tmp_log
+    attempts="$(int_value_or_default "${QUEUE_ATTEMPTS:-0}" "0" "0" "100000")"
+    attempts=$((attempts + 1))
+    telegram_queue_update_processing_job "$processing_file" "$attempts" "" || true
+    TRACE_ID="${QUEUE_TRACE_ID:-}" trace_event queue_job_started source=telegram-queue source_id="${QUEUE_SOURCE_ID:-}" job="${QUEUE_JOB_ID:-unknown}" attempt="$attempts" file="${QUEUE_PATH:-}"
+
+    retries="$(int_value_or_default "${QUEUE_RETRIES:-0}" "0" "0" "100")"
+    wait="$(int_value_or_default "${QUEUE_WAIT:-0}" "0" "0" "3600")"
+    tmp_log="${QUEUE_TMP_LOG:-$RUN_DIR/telegram-queue-response.json}"
+    token=""
+    chat=""
+    if [ -n "${QUEUE_BOT_VAR:-}" ]; then
+      token="${!QUEUE_BOT_VAR:-}"
+    fi
+    if [ -n "${QUEUE_CHAT_VAR:-}" ]; then
+      chat="${!QUEUE_CHAT_VAR:-}"
+    fi
+
+    if [ -z "${QUEUE_SOURCE_ID:-}" ] || [ -z "${QUEUE_PATH:-}" ]; then
+      error="Job without source or file"
+      telegram_queue_move_processing_job "$processing_file" failed failed "$error" || true
+      log ERROR "QUEUE-FAILED job=${QUEUE_JOB_ID:-unknown} error=$error"
+      processed=$((processed + 1))
+      continue
+    fi
+
+    if [ ! -f "${QUEUE_PATH:-}" ]; then
+      error="File missing: ${QUEUE_PATH:-}"
+      max_attempts="$(int_value_or_default "${TELEGRAM_QUEUE_MAX_ATTEMPTS:-30}" "30" "1" "100000")"
+      if [ "$attempts" -ge "$max_attempts" ]; then
+        telegram_queue_move_processing_job "$processing_file" failed failed "$error" || true
+        log ERROR "QUEUE-FAILED source=${QUEUE_SOURCE_ID:-} job=${QUEUE_JOB_ID:-unknown} attempts=$attempts error=$error"
+      else
+        next_epoch=$((now + $(int_value_or_default "${TELEGRAM_QUEUE_RETRY_SECONDS:-60}" "60" "5" "86400")))
+        telegram_queue_move_processing_job "$processing_file" pending pending "$error" "$next_epoch" || true
+        log WARN "QUEUE-RETRY source=${QUEUE_SOURCE_ID:-} job=${QUEUE_JOB_ID:-unknown} attempts=$attempts error=$error"
+      fi
+      processed=$((processed + 1))
+      continue
+    fi
+
+    if candidate_matches_send_state "${QUEUE_SOURCE_ID:-}" "${QUEUE_PATH:-}"; then
+      telegram_queue_move_processing_job "$processing_file" done already-sent-by-state "" || true
+      log INFO "QUEUE-DONE source=${QUEUE_SOURCE_ID:-} job=${QUEUE_JOB_ID:-unknown} state=already-sent-by-state"
+      TRACE_ID="${QUEUE_TRACE_ID:-}" trace_event queue_job_done source=telegram-queue source_id="${QUEUE_SOURCE_ID:-}" job="${QUEUE_JOB_ID:-unknown}" result=already-sent-by-state file="${QUEUE_PATH:-}"
+      processed=$((processed + 1))
+      continue
+    fi
+
+    if [ -z "$token" ] || [ -z "$chat" ]; then
+      rc=12
+      error="Telegram Token oder Chat missing"
+      TRACE_ID="${QUEUE_TRACE_ID:-}" trace_event telegram_send_failed source=telegram-queue source_id="${QUEUE_SOURCE_ID:-}" job="${QUEUE_JOB_ID:-unknown}" file="${QUEUE_PATH:-}" rc="$rc" reason=credentials-missing
+    else
+      log INFO "QUEUE-SEND source=${QUEUE_SOURCE_ID:-} job=${QUEUE_JOB_ID:-unknown} attempt=$attempts file=${QUEUE_PATH:-}"
+      TRACE_ID="${QUEUE_TRACE_ID:-}" TRACE_SOURCE="${QUEUE_SOURCE_ID:-}" TRACE_SEND_SOURCE="telegram-queue" TRACE_QUEUE_JOB="${QUEUE_JOB_ID:-unknown}" \
+        send_telegram_file "$token" "$chat" "${QUEUE_PATH:-}" "$retries" "$wait" "$tmp_log" "${QUEUE_CHAT_VAR:-}" "${QUEUE_TELEGRAM_MODE:-auto}"
+      rc=$?
+      error="$(telegram_queue_error_detail "$rc" "$tmp_log")"
+    fi
+
+    if [ "$rc" -eq 0 ]; then
+      if write_send_state "${QUEUE_SOURCE_ID:-}" "${QUEUE_PATH:-}" "queue-send-ok" "${QUEUE_LEGACY_LAST_FILE:-}"; then
+        log INFO "QUEUE-SEND-OK source=${QUEUE_SOURCE_ID:-} job=${QUEUE_JOB_ID:-unknown} send_state_updated=$(send_state_file "${QUEUE_SOURCE_ID:-}")"
+        TRACE_ID="${QUEUE_TRACE_ID:-}" trace_event send_state_written source=telegram-queue source_id="${QUEUE_SOURCE_ID:-}" job="${QUEUE_JOB_ID:-unknown}" file="${QUEUE_PATH:-}" result=ok
+        TRACE_ID="${QUEUE_TRACE_ID:-}" trace_event queue_job_done source=telegram-queue source_id="${QUEUE_SOURCE_ID:-}" job="${QUEUE_JOB_ID:-unknown}" result=sent file="${QUEUE_PATH:-}"
+        telegram_queue_move_processing_job "$processing_file" done sent "" || true
+      else
+        error="Telegram sent, send state could not be written"
+        log ERROR "QUEUE-SEND-OK-STATE-FAILED source=${QUEUE_SOURCE_ID:-} job=${QUEUE_JOB_ID:-unknown}"
+        TRACE_ID="${QUEUE_TRACE_ID:-}" trace_event queue_job_done source=telegram-queue source_id="${QUEUE_SOURCE_ID:-}" job="${QUEUE_JOB_ID:-unknown}" result=sent-state-failed file="${QUEUE_PATH:-}"
+        telegram_queue_move_processing_job "$processing_file" done sent-state-failed "$error" || true
+      fi
+    else
+      max_attempts="$(int_value_or_default "${TELEGRAM_QUEUE_MAX_ATTEMPTS:-30}" "30" "1" "100000")"
+      if [ "$attempts" -ge "$max_attempts" ]; then
+        telegram_queue_move_processing_job "$processing_file" failed failed "$error" || true
+        log ERROR "QUEUE-SEND-FAILED source=${QUEUE_SOURCE_ID:-} job=${QUEUE_JOB_ID:-unknown} attempts=$attempts max=$max_attempts error=$error"
+        TRACE_ID="${QUEUE_TRACE_ID:-}" trace_event queue_job_done source=telegram-queue source_id="${QUEUE_SOURCE_ID:-}" job="${QUEUE_JOB_ID:-unknown}" result=failed attempts="$attempts" file="${QUEUE_PATH:-}"
+      else
+        next_epoch=$((now + $(int_value_or_default "${TELEGRAM_QUEUE_RETRY_SECONDS:-60}" "60" "5" "86400")))
+        telegram_queue_move_processing_job "$processing_file" pending pending "$error" "$next_epoch" || true
+        log WARN "QUEUE-SEND-RETRY source=${QUEUE_SOURCE_ID:-} job=${QUEUE_JOB_ID:-unknown} attempts=$attempts next_epoch=$next_epoch error=$error"
+        TRACE_ID="${QUEUE_TRACE_ID:-}" trace_event queue_job_done source=telegram-queue source_id="${QUEUE_SOURCE_ID:-}" job="${QUEUE_JOB_ID:-unknown}" result=retry attempts="$attempts" next_epoch="$next_epoch" file="${QUEUE_PATH:-}"
+      fi
+    fi
+
+    processed=$((processed + 1))
+  done
+
+  telegram_queue_prune_done
+  log INFO "telegram queue worker done processed=$processed"
+  trace_event queue_worker_done source=telegram-queue processed="$processed"
+  return 0
+}
+
+print_source_status() {
+  local dir="$1"
+  local entry id enabled pattern last_file bot_var chat_var retries wait tmp_log candidate state size mtime state_file
+  for entry in "${SOURCES[@]}"; do
+    [[ "$entry" =~ ^[[:space:]]*# ]] && continue
+    source_parse_entry "$entry"; id="$SRC_ID"; enabled="$SRC_ENABLED"; profile="$SRC_PROFILE"; label="$SRC_LABEL"; pattern="$SRC_MATCH"; extensions="$SRC_EXTENSIONS"; telegram_mode="$SRC_TELEGRAM_MODE"; last_file="$SRC_LAST_FILE"; bot_var="$SRC_BOT_VAR"; chat_var="$SRC_CHAT_VAR"; retries="$SRC_RETRIES"; wait="$SRC_WAIT"; tmp_log="$SRC_TMP_LOG"
+    [ "${enabled:-0}" = "1" ] || {
+      printf 'source=%s enabled=0 pattern=%s\n' "$id" "$pattern"
+      continue
+    }
+    candidate="$(latest_file_matching "$dir" "$pattern" "$extensions" 2>/dev/null || true)"
+    if [ -z "$candidate" ]; then
+      printf 'source=%s enabled=1 pattern=%s candidate=NONE\n' "$id" "$pattern"
+      continue
+    fi
+    size="$(stat -c '%s' "$candidate" 2>/dev/null || echo '?')"
+    mtime="$(stat -c '%y' "$candidate" 2>/dev/null || echo '?')"
+    state_file="$(send_state_file "$id")"
+    if candidate_matches_send_state "$id" "$candidate"; then
+      state="already-sent-by-state"
+    elif legacy_last_copy_matches_candidate "$last_file" "$candidate"; then
+      state="legacy-last-copy-match"
+    else
+      state="new-or-changed"
+    fi
+    printf 'source=%s enabled=1 pattern=%s state=%s size=%s mtime="%s" candidate="%s" send_state="%s" legacy_last_copy="%s"\n' \
+      "$id" "$pattern" "$state" "$size" "$mtime" "$candidate" "$state_file" "$last_file"
+  done
+}
+
+cmd_status() {
+  ensure_dirs
+  echo "vdisk-relay=$VERSION"
+  echo "config=$CONFIG_FILE readable=$([ -r "$CONFIG_FILE" ] && echo yes || echo no)"
+  echo "env=$ENV_FILE readable=$([ -r "$ENV_FILE" ] && echo yes || echo no)"
+  echo "image=$IMAGE_FILE exists=$([ -e "$IMAGE_FILE" ] && echo yes || echo no)"
+  [ -e "$IMAGE_FILE" ] && stat -c 'image_size=%s image_mtime=%y' "$IMAGE_FILE"
+  echo "data_root=$DATA_ROOT exists=$([ -d "$DATA_ROOT" ] && echo yes || echo no)"
+  echo "mountpoint=$MOUNTPOINT mounted=$(is_mounted "$MOUNTPOINT" && echo yes || echo no)"
+  echo "g_mass_storage_loaded=$(module_loaded g_mass_storage && echo yes || echo no)"
+  echo "dwc2_loaded=$(module_loaded dwc2 && echo yes || echo no)"
+  echo "libcomposite_loaded=$(module_loaded libcomposite && echo yes || echo no)"
+  echo "legacy_motion_lock=$([ -f /tmp/motion.lock ] && echo present || echo absent)"
+  echo "new_pending=$([ -f "$RUN_DIR/pending" ] && echo present || echo absent)"
+  [ -f "$RUN_DIR/pending" ] && stat -c 'new_pending_mtime=%y' "$RUN_DIR/pending"
+  return 0
+}
+
+cmd_config() {
+  cat <<CFG
+IMAGE_FILE=$IMAGE_FILE
+MOUNTPOINT=$MOUNTPOINT
+DATA_ROOT=$DATA_ROOT
+STATE_DIR=$STATE_DIR
+RUN_DIR=$RUN_DIR
+LOG_FILE=$LOG_FILE
+PARTITION_OFFSET_SECTORS=$PARTITION_OFFSET_SECTORS
+MOUNT_FSTYPE=$MOUNT_FSTYPE
+WATCH_EVENT=$WATCH_EVENT
+WATCH_DEBOUNCE_SECONDS=$WATCH_DEBOUNCE_SECONDS
+MAX_DATA_AGE_SECONDS=$MAX_DATA_AGE_SECONDS
+IMAGE_STALE_SECONDS=$IMAGE_STALE_SECONDS
+IMAGE_STALE_REBOOT_COOLDOWN_SECONDS=$IMAGE_STALE_REBOOT_COOLDOWN_SECONDS
+GADGET_MODPROBE_ARGS=$GADGET_MODPROBE_ARGS
+SYNC_PASSES=$SYNC_PASSES
+LIVE_QUIET_SECONDS=$LIVE_QUIET_SECONDS
+LIVE_FAST_LANE_ENABLED=$LIVE_FAST_LANE_ENABLED
+LIVE_FAST_LANE_DELAY_SECONDS=$LIVE_FAST_LANE_DELAY_SECONDS
+LIVE_FAST_QUIET_SECONDS=$LIVE_FAST_QUIET_SECONDS
+SYNC_RSYNC_OPTIONS=$SYNC_RSYNC_OPTIONS
+SYNC_RSYNC_DRYRUN_OPTIONS=$SYNC_RSYNC_DRYRUN_OPTIONS
+TIMELINE_TRACE_ENABLED=$TIMELINE_TRACE_ENABLED
+TIMELINE_TRACE_FILE=$TIMELINE_TRACE_FILE
+TIMELINE_TRACE_SYSTEM_SNAPSHOT=$TIMELINE_TRACE_SYSTEM_SNAPSHOT
+TELEGRAM_TRACE_REPLY_BODY=$TELEGRAM_TRACE_REPLY_BODY
+TELEGRAM_TRACE_REPLY_MAX_BYTES=$TELEGRAM_TRACE_REPLY_MAX_BYTES
+ULTRA_FAST_LANE_ENABLED=$ULTRA_FAST_LANE_ENABLED
+ULTRA_FAST_LANE_DELAY_SECONDS=$ULTRA_FAST_LANE_DELAY_SECONDS
+ULTRA_FAST_LANE_QUIET_SECONDS=$ULTRA_FAST_LANE_QUIET_SECONDS
+ULTRA_FAST_LANE_SYNC_AFTER_SEND=$ULTRA_FAST_LANE_SYNC_AFTER_SEND
+ULTRA_FAST_DUPLICATE_MODE=$ULTRA_FAST_DUPLICATE_MODE
+ULTRA_FAST_REMAINDER_QUEUE_ENABLED=$ULTRA_FAST_REMAINDER_QUEUE_ENABLED
+ULTRA_FAST_REMAINDER_QUEUE_DELAY_SECONDS=$ULTRA_FAST_REMAINDER_QUEUE_DELAY_SECONDS
+CFG
+  echo "SOURCES:"
+  local entry id enabled profile label pattern extensions telegram_mode last_file bot_var chat_var retries wait tmp_log
+  for entry in "${SOURCES[@]}"; do
+    [[ "$entry" =~ ^[[:space:]]*# ]] && continue
+    source_parse_entry "$entry"; id="$SRC_ID"; enabled="$SRC_ENABLED"; profile="$SRC_PROFILE"; label="$SRC_LABEL"; pattern="$SRC_MATCH"; extensions="$SRC_EXTENSIONS"; telegram_mode="$SRC_TELEGRAM_MODE"; last_file="$SRC_LAST_FILE"; bot_var="$SRC_BOT_VAR"; chat_var="$SRC_CHAT_VAR"; retries="$SRC_RETRIES"; wait="$SRC_WAIT"; tmp_log="$SRC_TMP_LOG"
+    printf '  id=%s enabled=%s profile=%s label=%s match=%s extensions=%s telegram_mode=%s last_file=%s token_env=%s chat_env=%s retries=%s wait=%s tmp_log=%s\n' \
+      "$id" "$enabled" "$profile" "$label" "$pattern" "$extensions" "$telegram_mode" "$last_file" "$bot_var" "$chat_var" "$retries" "$wait" "$tmp_log"
+  done
+}
+
+cmd_inspect_data() {
+  local entry id enabled profile label pattern extensions telegram_mode dir
+  for entry in "${SOURCES[@]}"; do
+    [[ "$entry" =~ ^[[:space:]]*# ]] && continue
+    source_parse_entry "$entry"; id="$SRC_ID"; enabled="$SRC_ENABLED"; profile="$SRC_PROFILE"; label="$SRC_LABEL"; pattern="$SRC_MATCH"; extensions="$SRC_EXTENSIONS"; telegram_mode="$SRC_TELEGRAM_MODE"
+    [ "${enabled:-0}" = "1" ] || continue
+    dir="$(source_latest_dir_for_root "$DATA_ROOT" "$profile" 2>/dev/null || true)"
+    if [ -z "$dir" ]; then
+      echo "source=$id latest_dir=NONE"
+      continue
+    fi
+    echo "source=$id latest_dir=$dir"
+    print_source_status "$dir"
+  done
+}
+
+telegram_chat_type_from_id() {
+  local chat_id="$1"
+  case "$chat_id" in
+    -100[0-9]*)
+      echo "supergroup"
+      ;;
+    -[0-9]*)
+      echo "group"
+      ;;
+    "")
+      echo ""
+      ;;
+    *)
+      echo "private"
+      ;;
+  esac
+}
+
+telegram_chat_type_var() {
+  local chat_var="$1"
+  if [ "${chat_var%_CHAT_ID}" != "$chat_var" ]; then
+    printf '%s_CHAT_TYPE\n' "${chat_var%_CHAT_ID}"
+    return 0
+  fi
+  printf '%s_CHAT_TYPE\n' "$chat_var"
+}
+
+telegram_set_env_value() {
+  local var_name="$1" var_value="$2" perm tmp_file
+
+  [ -n "$var_name" ] || return 1
+  [ -f "$ENV_FILE" ] || return 1
+  [ -w "$ENV_FILE" ] || return 1
+
+  tmp_file="$(mktemp /tmp/vdisk-relay-env.XXXXXX)" || return 1
+  perm="$(stat -c %a "$ENV_FILE" 2>/dev/null || echo 600)"
+
+  awk -v var_name="$var_name" -v var_value="$var_value" '
+    BEGIN { replaced=0 }
+    $0 ~ ("^" var_name "=") {
+      print var_name "=\"" var_value "\""
+      replaced=1
+      next
+    }
+    { print }
+    END {
+      if (!replaced) {
+        print var_name "=\"" var_value "\""
+      }
+    }' "$ENV_FILE" > "$tmp_file"
+
+  mv "$tmp_file" "$ENV_FILE" || {
+    rm -f "$tmp_file"
+    return 1
+  }
+
+  chmod "$perm" "$ENV_FILE" 2>/dev/null || true
+  return 0
+}
+
+telegram_apply_chat_type() {
+  local chat_var="$1" chat_id="$2" chat_type_var chat_type
+  [ -n "$chat_var" ] || return 1
+  [ -n "$chat_id" ] || return 1
+
+  chat_type_var="$(telegram_chat_type_var "$chat_var")"
+  chat_type="$(telegram_chat_type_from_id "$chat_id")"
+
+  if ! telegram_set_env_value "$chat_type_var" "$chat_type"; then
+    log WARN "telegram chat type: ENV_FILE '$ENV_FILE' not writable (in-memory only)"
+    return 1
+  fi
+
+  export "$chat_type_var=$chat_type"
+  return 0
+}
+
+telegram_apply_chat_migration() {
+  local var_name="$1" old_chat="$2" new_chat="$3"
+  local chat_type_var chat_type
+
+  [ -n "$var_name" ] || return 1
+  [ -n "$new_chat" ] || return 1
+  [ "$old_chat" = "$new_chat" ] && return 0
+
+  if ! telegram_set_env_value "$var_name" "$new_chat"; then
+    log WARN "telegram chat migration: ENV_FILE '$ENV_FILE' not writable (in-memory only)"
+    return 1
+  fi
+
+  export "$var_name=$new_chat"
+  chat_type_var="$(telegram_chat_type_var "$var_name")"
+  chat_type="$(telegram_chat_type_from_id "$new_chat")"
+  telegram_set_env_value "$chat_type_var" "$chat_type" || true
+  log INFO "telegram chat migration: persisted ${var_name}=${new_chat} in ${ENV_FILE}"
+  return 0
+}
+
+send_telegram_file() {
+  local token="$1" chat="$2" fullpath="$3" retries="$4" wait="$5" tmp_log="$6" chat_var="${7:-}" telegram_mode="${8:-auto}"
+  local attempt response_file rc migration_to error_code error_desc http_code max_attempts attempt_start duration reply_body reply_args telegram_ok trace_active
+  local method_info telegram_method telegram_field media_type
+  [ -n "$token" ] || return 11
+  [ -n "$chat" ] || return 12
+  [ -f "$fullpath" ] || return 13
+  response_file="$tmp_log"
+  max_attempts=$((retries + 1))
+  trace_active=0
+  trace_enabled && trace_active=1
+  method_info="$(telegram_method_for_file "$telegram_mode" "$fullpath")"
+  telegram_method="${method_info%%|*}"
+  telegram_field="${method_info#*|}"
+  media_type="$(media_type_for_file "$fullpath")"
+
+  attempt=0
+  while [ "$attempt" -le "$retries" ]; do
+    attempt=$((attempt + 1))
+    : > "$response_file" 2>/dev/null || true
+    chmod 600 "$response_file" 2>/dev/null || true
+    attempt_start=""
+    if [ "$trace_active" -eq 1 ]; then
+      attempt_start="$(now_ms)"
+      trace_event telegram_attempt_started \
+        source="${TRACE_SEND_SOURCE:-send_telegram_file}" \
+        source_id="${TRACE_SOURCE:-}" \
+        job="${TRACE_QUEUE_JOB:-}" \
+        attempt="$attempt" \
+        attempts_total="$max_attempts" \
+        media_type="$media_type" \
+        telegram_mode="$telegram_mode" \
+        telegram_method="$telegram_method" \
+        file="$fullpath"
+    fi
+    http_code="$(curl -sS --max-time "$CURL_MAX_TIME" \
+      -o "$response_file" \
+      -w '%{http_code}' \
+      -X POST "https://api.telegram.org/bot${token}/${telegram_method}" \
+      -F "chat_id=${chat}" \
+      -F "${telegram_field}=@${fullpath}")"
+    rc=$?
+    [ -n "$http_code" ] || http_code="000"
+    duration=""
+    [ "$trace_active" -eq 1 ] && duration="$(duration_since_ms "$attempt_start")"
+
+    migration_to="$(tr -d '\r' < "$response_file" 2>/dev/null | sed -n 's/.*"migrate_to_chat_id"[[:space:]]*:[[:space:]]*\(-\?[0-9][0-9]*\).*/\1/p' | head -n1)"
+    error_code="$(tr -d '\r' < "$response_file" 2>/dev/null | sed -n 's/.*"error_code"[[:space:]]*:[[:space:]]*\(-\?[0-9][0-9]*\).*/\1/p' | head -n1)"
+    error_desc="$(tr -d '\r' < "$response_file" 2>/dev/null | sed -n 's/.*"description"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n1)"
+    if [ -n "$migration_to" ] && [ -n "$chat_var" ]; then
+      telegram_apply_chat_migration "$chat_var" "$chat" "$migration_to" && chat="$migration_to"
+    fi
+    if [ -n "$chat_var" ]; then
+      telegram_apply_chat_type "$chat_var" "$chat" || true
+    fi
+
+    telegram_ok=0
+    if [ "$rc" -eq 0 ] && [ "$http_code" = "200" ] && grep -q '"ok"[[:space:]]*:[[:space:]]*true' "$response_file"; then
+      telegram_ok=1
+    fi
+
+    reply_args=()
+    if [ "$trace_active" -eq 1 ] && [ "${TELEGRAM_TRACE_REPLY_BODY:-0}" = "1" ] && [ -r "$response_file" ]; then
+      reply_body="$(head -c "$(int_value_or_default "${TELEGRAM_TRACE_REPLY_MAX_BYTES:-20000}" "20000" "0" "200000")" "$response_file" 2>/dev/null | tr '\r\n' '  ' || true)"
+      reply_args=("reply_body=$reply_body")
+    fi
+    if [ "$trace_active" -eq 1 ]; then
+      trace_event telegram_attempt_done \
+        source="${TRACE_SEND_SOURCE:-send_telegram_file}" \
+        source_id="${TRACE_SOURCE:-}" \
+        job="${TRACE_QUEUE_JOB:-}" \
+        attempt="$attempt" \
+        attempts_total="$max_attempts" \
+        media_type="$media_type" \
+        telegram_mode="$telegram_mode" \
+        telegram_method="$telegram_method" \
+        file="$fullpath" \
+        rc="$rc" \
+        http_code="$http_code" \
+        ok="$telegram_ok" \
+        duration_ms="$duration" \
+        error_code="${error_code:-}" \
+        error_desc="${error_desc:-}" \
+        "${reply_args[@]}"
+    fi
+
+    if [ "$telegram_ok" -eq 1 ]; then
+      [ "$trace_active" -eq 1 ] && trace_event telegram_send_ok source="${TRACE_SEND_SOURCE:-send_telegram_file}" source_id="${TRACE_SOURCE:-}" job="${TRACE_QUEUE_JOB:-}" file="$fullpath" media_type="$media_type" telegram_mode="$telegram_mode" telegram_method="$telegram_method" attempts="$attempt"
+      return 0
+    fi
+
+    if [ -n "$error_code" ] || [ -n "$error_desc" ] || [ -n "$migration_to" ]; then
+      log WARN "telegram file send failed method=$telegram_method attempt=$attempt/$max_attempts rc=$rc http=$http_code code=${error_code:-?} migration_to=${migration_to:-?} desc=${error_desc:-none}"
+    else
+      log WARN "telegram file send failed method=$telegram_method attempt=$attempt/$max_attempts rc=$rc http=$http_code"
+    fi
+    [ "$attempt" -le "$retries" ] && sleep "$wait"
+  done
+  [ "$trace_active" -eq 1 ] && trace_event telegram_send_failed source="${TRACE_SEND_SOURCE:-send_telegram_file}" source_id="${TRACE_SOURCE:-}" job="${TRACE_QUEUE_JOB:-}" file="$fullpath" media_type="$media_type" telegram_mode="$telegram_mode" telegram_method="$telegram_method" attempts="$attempt"
+  return 1
+}
+
+
+cmd_test_file_send() {
+  require_root
+  ensure_dirs
+
+  local source="" file="" do_send=0
+
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --source)
+        shift
+        source="${1:-}"
+        ;;
+      --file)
+        shift
+        file="${1:-}"
+        ;;
+      --send)
+        do_send=1
+        ;;
+      --dry-run)
+        do_send=0
+        ;;
+      *)
+        fail "Unknown option for test-file-send: $1"
+        ;;
+    esac
+    shift || true
+  done
+
+  [ -n "$source" ] || fail "Missing: --source ID"
+  [ -n "$file" ] || fail "Missing: --file PATH"
+  [ -f "$file" ] || fail "File missing: $file"
+
+  local entry id enabled pattern extensions telegram_mode last_file bot_var chat_var retries wait tmp_log token chat response_log rc
+
+  for entry in "${SOURCES[@]}"; do
+    [[ "$entry" =~ ^[[:space:]]*# ]] && continue
+    source_parse_entry "$entry"; id="$SRC_ID"; enabled="$SRC_ENABLED"; profile="$SRC_PROFILE"; label="$SRC_LABEL"; pattern="$SRC_MATCH"; extensions="$SRC_EXTENSIONS"; telegram_mode="$SRC_TELEGRAM_MODE"; last_file="$SRC_LAST_FILE"; bot_var="$SRC_BOT_VAR"; chat_var="$SRC_CHAT_VAR"; retries="$SRC_RETRIES"; wait="$SRC_WAIT"; tmp_log="$SRC_TMP_LOG"
+
+    [ "$id" = "$source" ] || continue
+
+    token="${!bot_var:-}"
+    chat="${!chat_var:-}"
+    response_log="$RUN_DIR/test-${id}.telegram-response.json"
+
+    if [ "$do_send" -ne 1 ]; then
+      log INFO "DRY-RUN TEST-FILE source=$id file=$file token_env=$bot_var chat_env=$chat_var response_log=$response_log"
+      return 0
+    fi
+
+    log INFO "TEST-FILE-SEND source=$id file=$file response_log=$response_log telegram_mode=$telegram_mode"
+    send_telegram_file "$token" "$chat" "$file" "$retries" "$wait" "$response_log" "$chat_var" "$telegram_mode"
+    rc=$?
+
+    if [ "$rc" -eq 0 ]; then
+      log INFO "TEST-FILE-SEND-OK source=$id file=$file state_not_modified=1"
+      return 0
+    fi
+
+    log ERROR "TEST-FILE-SEND-FAILED source=$id file=$file rc=$rc state_not_modified=1"
+    return "$rc"
+  done
+
+  fail "Unbekannte Source ID: $source"
+}
+
+
+cmd_test_text_send() {
+  require_root
+  ensure_dirs
+
+  local source="" message="" do_send=0
+
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --source)
+        shift
+        source="${1:-}"
+        ;;
+      --message)
+        shift
+        message="${1:-}"
+        ;;
+      --send)
+        do_send=1
+        ;;
+      --dry-run)
+        do_send=0
+        ;;
+      *)
+        fail "Unknown option for test-text-send: $1"
+        ;;
+    esac
+    shift || true
+  done
+
+  [ -n "$source" ] || fail "Missing: --source ID"
+  if [ -z "$message" ]; then
+    message="Test message for source ${source} on $(hostname 2>/dev/null || echo pi-host)"
+  fi
+
+  local entry id enabled pattern last_file bot_var chat_var token chat rc
+  for entry in "${SOURCES[@]}"; do
+    [[ "$entry" =~ ^[[:space:]]*# ]] && continue
+    source_parse_entry "$entry"; id="$SRC_ID"; enabled="$SRC_ENABLED"; profile="$SRC_PROFILE"; label="$SRC_LABEL"; pattern="$SRC_MATCH"; extensions="$SRC_EXTENSIONS"; telegram_mode="$SRC_TELEGRAM_MODE"; last_file="$SRC_LAST_FILE"; bot_var="$SRC_BOT_VAR"; chat_var="$SRC_CHAT_VAR"; retries="$SRC_RETRIES"; wait="$SRC_WAIT"; tmp_log="$SRC_TMP_LOG"
+
+    [ "$id" = "$source" ] || continue
+
+    token="${!bot_var:-}"
+    chat="${!chat_var:-}"
+    if [ -z "$token" ] || [ -z "$chat" ]; then
+      fail "Telegram credentials missing for source $id (bot_var=$bot_var, chat_var=$chat_var)"
+    fi
+
+    if [ "$do_send" -ne 1 ]; then
+      log INFO "DRY-RUN TEST-TEXT-SEND source=$id message_len=${#message}"
+      return 0
+    fi
+
+    log INFO "TEST-TEXT-SEND source=$id"
+    send_telegram_text "$token" "$chat" "$message" "$chat_var"
+    rc=$?
+    if [ "$rc" -eq 0 ]; then
+      log INFO "TEST-TEXT-SEND-OK source=$id"
+      return 0
+    fi
+
+    log ERROR "TEST-TEXT-SEND-FAILED source=$id rc=$rc"
+    return "$rc"
+  done
+
+  fail "Unbekannte Source ID: $source"
+}
+
+
+
+send_telegram_text() {
+  local token="$1" chat="$2" text="$3" chat_var="${4:-}"
+  local attempt rc tmp max_attempts delay max_time telegram_error telegram_error_code telegram_resp telegram_http_code migration_to
+
+  [ -n "$token" ] || return 11
+  [ -n "$chat" ] || return 12
+
+  max_attempts="${TELEGRAM_TEXT_RETRIES:-18}"
+  delay="${TELEGRAM_TEXT_RETRY_DELAY:-10}"
+  max_time="${TELEGRAM_TEXT_CURL_MAX_TIME:-20}"
+
+  mkdir -p "$RUN_DIR" 2>/dev/null || true
+  tmp="$RUN_DIR/telegram-text-response.json"
+
+  attempt=1
+  while [ "$attempt" -le "$max_attempts" ]; do
+    : > "$tmp" 2>/dev/null || true
+
+    telegram_http_code="$(curl -sS --max-time "$max_time" --write-out '%{http_code}' --output "$tmp" \
+      -X POST "https://api.telegram.org/bot${token}/sendMessage" \
+      --data-urlencode "parse_mode=HTML" \
+      --data-urlencode "chat_id=${chat}" \
+      --data-urlencode "text=${text}" )"
+    rc=$?
+    [ -n "$telegram_http_code" ] || telegram_http_code="-"
+    telegram_error="$(tr -d '\r' < "$tmp" 2>/dev/null | sed -n 's/.*"description"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n 1)"
+    telegram_error_code="$(tr -d '\r' < "$tmp" 2>/dev/null | sed -n 's/.*"error_code"[[:space:]]*:[[:space:]]*\(-\?[0-9][0-9]*\).*/\1/p' | head -n 1)"
+    migration_to="$(tr -d '\r' < "$tmp" 2>/dev/null | sed -n 's/.*"migrate_to_chat_id"[[:space:]]*:[[:space:]]*\(-\?[0-9][0-9]*\).*/\1/p' | head -n 1)"
+    telegram_resp="$(tr -d '\r' < "$tmp" | head -c 180 | tr '\n' ' ')"
+    if [ -n "$migration_to" ] && [ -n "$chat_var" ]; then
+      telegram_apply_chat_migration "$chat_var" "$chat" "$migration_to" && chat="$migration_to"
+    fi
+    if [ -n "$chat_var" ]; then
+      telegram_apply_chat_type "$chat_var" "$chat" || true
+    fi
+
+    if [ "$rc" -eq 0 ] && [ "$telegram_http_code" = "200" ] && grep -q '"ok"[[:space:]]*:[[:space:]]*true' "$tmp"; then
+      log INFO "telegram text send ok attempt=$attempt"
+      return 0
+    fi
+
+    if [ -n "$telegram_error" ] || [ -n "$telegram_error_code" ] || [ -n "$migration_to" ]; then
+      log WARN "telegram text send failed attempt=$attempt/$max_attempts rc=$rc http=$telegram_http_code code=${telegram_error_code:-?} migration_to=${migration_to:-?} desc=${telegram_error:-none}"
+    elif [ -n "$telegram_resp" ]; then
+      log WARN "telegram text send failed attempt=$attempt/$max_attempts rc=$rc http=$telegram_http_code resp=$telegram_resp"
+    else
+      log WARN "telegram text send failed attempt=$attempt/$max_attempts rc=$rc http=$telegram_http_code"
+    fi
+    attempt=$((attempt + 1))
+    [ "$attempt" -le "$max_attempts" ] && sleep "$delay"
+  done
+
+  log ERROR "telegram text send failed after ${max_attempts} attempts"
+  return 1
+}
+
+
+cmd_notify_data() {
+  local do_send=0 candidate_list=""
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --send) do_send=1 ;;
+      --dry-run) do_send=0 ;;
+      --candidate-list)
+        shift
+        [ "$#" -gt 0 ] || fail "--candidate-list requires a file"
+        candidate_list="${1:-}"
+        ;;
+      *) fail "Unknown option for notify-data: $1" ;;
+    esac
+    shift
+  done
+
+  local dir="" use_candidate_list=0
+  if [ -n "$candidate_list" ] && [ -s "$candidate_list" ]; then
+    use_candidate_list=1
+    log INFO "notify-data: nutze rsync candidate-list=$candidate_list count=$(line_count "$candidate_list")"
+  fi
+
+  local entry id enabled profile label pattern extensions telegram_mode last_file bot_var chat_var retries wait tmp_log candidate token chat rc failures state_file candidate_source queue_started
+  failures=0
+  queue_started=0
+
+  for entry in "${SOURCES[@]}"; do
+    [[ "$entry" =~ ^[[:space:]]*# ]] && continue
+    source_parse_entry "$entry"; id="$SRC_ID"; enabled="$SRC_ENABLED"; profile="$SRC_PROFILE"; label="$SRC_LABEL"; pattern="$SRC_MATCH"; extensions="$SRC_EXTENSIONS"; telegram_mode="$SRC_TELEGRAM_MODE"; last_file="$SRC_LAST_FILE"; bot_var="$SRC_BOT_VAR"; chat_var="$SRC_CHAT_VAR"; retries="$SRC_RETRIES"; wait="$SRC_WAIT"; tmp_log="$SRC_TMP_LOG"
+    [ "${enabled:-0}" = "1" ] || {
+      log INFO "source=$id disabled"
+      continue
+    }
+
+    candidate=""
+    candidate_source=""
+    if [ "$use_candidate_list" -eq 1 ]; then
+      candidate="$(latest_candidate_matching "$candidate_list" "$pattern" "$extensions" 2>/dev/null || true)"
+      if [ -n "$candidate" ]; then
+        candidate_source="rsync-list"
+      fi
+    fi
+
+    if [ -z "$candidate" ]; then
+      dir="$(source_latest_dir_for_root "$DATA_ROOT" "$profile" 2>/dev/null || true)"
+      if [ -n "$dir" ]; then
+        candidate="$(latest_file_matching "$dir" "$pattern" "$extensions" 2>/dev/null || true)"
+        [ -n "$candidate" ] && candidate_source="latest-scan"
+      fi
+    fi
+
+    if [ -z "$candidate" ]; then
+      log INFO "source=$id pattern=$pattern candidate=NONE source=${candidate_source:-none}"
+      continue
+    fi
+    trace_event candidate_found source=notify-data source_id="$id" file="$candidate" candidate_source="$candidate_source" basename="$(basename "$candidate")"
+
+    state_file="$(send_state_file "$id")"
+    if candidate_matches_send_state "$id" "$candidate"; then
+      log INFO "source=$id candidate=$(basename "$candidate") source=$candidate_source state=already-sent-by-state send_state=$state_file"
+      continue
+    fi
+
+    if legacy_last_copy_matches_candidate "$last_file" "$candidate"; then
+      if [ "$do_send" -eq 1 ]; then
+        if write_send_state "$id" "$candidate" "legacy-last-copy" "$last_file"; then
+          log INFO "source=$id candidate=$(basename "$candidate") source=$candidate_source state=already-sent-by-legacy send_state_seeded=$state_file"
+        else
+          failures=$((failures + 1))
+          log ERROR "source=$id candidate=$(basename "$candidate") source=$candidate_source state=legacy-match send_state_update_failed=$state_file"
+        fi
+      else
+        log INFO "DRY-RUN source=$id candidate=$(basename "$candidate") source=$candidate_source state=legacy-last-copy-match would_seed_send_state=$state_file"
+      fi
+      continue
+    fi
+
+    if [ "$do_send" -ne 1 ]; then
+      if [ "${TELEGRAM_QUEUE_ENABLED:-1}" = "1" ]; then
+        log INFO "DRY-RUN source=$id would_enqueue=$(basename "$candidate") source=$candidate_source would_update_send_state_after_queue=$state_file"
+      else
+        log INFO "DRY-RUN source=$id would_send=$(basename "$candidate") source=$candidate_source would_update_send_state=$state_file"
+      fi
+      continue
+    fi
+
+    if [ "${TELEGRAM_QUEUE_ENABLED:-1}" = "1" ]; then
+      if telegram_queue_enqueue_job "$id" "$candidate" "$last_file" "$bot_var" "$chat_var" "$retries" "$wait" "$tmp_log" "$candidate_source" "$telegram_mode"; then
+        queue_started=1
+      else
+        failures=$((failures + 1))
+        log ERROR "QUEUE-ENQUEUE-FAILED source=$id source=$candidate_source file=$candidate"
+      fi
+      continue
+    fi
+
+    token="${!bot_var:-}"
+    chat="${!chat_var:-}"
+    log INFO "SEND source=$id source=$candidate_source file=$candidate"
+    TRACE_SOURCE="$id" TRACE_SEND_SOURCE="$candidate_source" send_telegram_file "$token" "$chat" "$candidate" "$retries" "$wait" "$tmp_log" "$chat_var" "$telegram_mode"
+    rc=$?
+    if [ "$rc" -eq 0 ]; then
+      if write_send_state "$id" "$candidate" "send-ok" "$last_file"; then
+        log INFO "SEND-OK source=$id send_state_updated=$state_file"
+        trace_event send_state_written source=notify-data source_id="$id" file="$candidate" result=ok
+      else
+        failures=$((failures + 1))
+        log ERROR "SEND-OK-STATE-FAILED source=$id send_state_not_updated=$state_file"
+      fi
+    else
+      failures=$((failures + 1))
+      log ERROR "SEND-FAILED source=$id rc=$rc send_state_not_updated"
+    fi
+  done
+
+  if [ "$failures" -gt 0 ]; then
+    log ERROR "notify-data: failures=$failures"
+    return 1
+  fi
+
+  if [ "$queue_started" -eq 1 ]; then
+    telegram_queue_start_worker_async
+  fi
+
+  return 0
+}
+
+
+shadow_mount() {
+  require_root
+  ensure_dirs
+  [ -f "$IMAGE_FILE" ] || fail "Image missing: $IMAGE_FILE"
+  if is_mounted "$MOUNTPOINT"; then
+    fail "Mountpoint ist bereits gemountet: $MOUNTPOINT"
+  fi
+  local offset loopdev
+  offset=$((PARTITION_OFFSET_SECTORS * 512))
+  loopdev="$(losetup --find --show --read-only --offset "$offset" "$IMAGE_FILE")" || fail "losetup failed"
+  if ! mount -o ro -t "$MOUNT_FSTYPE" "$loopdev" "$MOUNTPOINT"; then
+    losetup -d "$loopdev" 2>/dev/null || true
+    fail "mount failed: $loopdev -> $MOUNTPOINT"
+  fi
+  printf '%s\n' "$loopdev"
+}
+
+shadow_umount() {
+  local loopdev="${1:-}"
+  sync 2>/dev/null || true
+  if is_mounted "$MOUNTPOINT"; then
+    umount "$MOUNTPOINT" || log ERROR "umount failed: $MOUNTPOINT"
+  fi
+  if [ -n "$loopdev" ]; then
+    losetup -d "$loopdev" 2>/dev/null || log WARN "losetup detach failed: $loopdev"
+  fi
+}
+
+
+cleanup_stale_image_loops() {
+  local dev
+  for dev in $(losetup -j "$IMAGE_FILE" 2>/dev/null | cut -d: -f1); do
+    [ -n "$dev" ] || continue
+
+    if findmnt -rn -S "$dev" >/dev/null 2>&1; then
+      log WARN "cleanup: loop $dev is still mounted, detach skipped"
+      continue
+    fi
+
+    if losetup -d "$dev" 2>/dev/null; then
+      log INFO "cleanup: stale loop detached: $dev"
+    else
+      log WARN "cleanup: stale loop detach failed: $dev"
+    fi
+  done
+}
+
+image_check_active() {
+  [ -e "$RUN_DIR/image-check.active" ]
+}
+
+
+preview_suspend_dir() {
+  printf '%s\n' "$RUN_DIR/preview-suspend.d"
+}
+
+
+preview_suspend_pid_file() {
+  printf '%s\n' "$RUN_DIR/preview-ffmpeg.pid"
+}
+
+
+preview_token_safe_part() {
+  printf '%s' "${1:-manual}" | tr -c 'A-Za-z0-9_.-' '_' | cut -c1-80
+}
+
+
+preview_registered_pid() {
+  local pid_file
+  pid_file="$(preview_suspend_pid_file)"
+  [ -r "$pid_file" ] || return 1
+  command -v python3 >/dev/null 2>&1 || return 1
+  python3 - "$pid_file" <<'PY'
+import json
+import os
+import sys
+
+path = sys.argv[1]
+try:
+    with open(path, "r", encoding="utf-8") as f:
+        payload = json.load(f)
+    if payload.get("owner") != "vdisk-relay-preview-cache":
+        raise ValueError("wrong owner")
+    pid = int(payload.get("pid", 0))
+    expected = str(payload.get("start_time", ""))
+    if pid <= 1 or not expected:
+        raise ValueError("invalid pid payload")
+    with open(f"/proc/{pid}/stat", "r", encoding="utf-8", errors="replace") as f:
+        stat = f.read()
+    current = stat.rsplit(") ", 1)[1].split()[19]
+    if current != expected:
+        raise ValueError("process start time mismatch")
+    print(pid)
+except Exception:
+    sys.exit(1)
+PY
+}
+
+
+preview_kill_registered_ffmpeg() {
+  local reason="${1:-manual}" pid pid_file
+  pid_file="$(preview_suspend_pid_file)"
+  pid="$(preview_registered_pid 2>/dev/null || true)"
+  if [ -z "$pid" ]; then
+    log INFO "preview-suspend: no registered preview ffmpeg to stop reason=$reason"
+    return 0
+  fi
+
+  if kill -TERM "-$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null; then
+    log WARN "preview-suspend: stopped preview ffmpeg pid=$pid reason=$reason"
+    sleep 1
+    if kill -0 "$pid" 2>/dev/null; then
+      kill -KILL "-$pid" 2>/dev/null || kill -KILL "$pid" 2>/dev/null || true
+      log WARN "preview-suspend: killed stubborn preview ffmpeg pid=$pid reason=$reason"
+    fi
+  else
+    log INFO "preview-suspend: registered preview ffmpeg already gone pid=$pid reason=$reason"
+  fi
+
+  rm -f "$pid_file"
+}
+
+
+preview_suspend_begin() {
+  local reason="${1:-manual}" token safe dir path
+  dir="$(preview_suspend_dir)"
+  mkdir -p "$dir"
+  safe="$(preview_token_safe_part "$reason")"
+  [ -n "$safe" ] || safe="manual"
+  token="$(date +%s).$$.$safe"
+  path="$dir/$token"
+  {
+    echo "timestamp=$(date --iso-8601=seconds)"
+    echo "reason=$reason"
+    echo "pid=$$"
+  } > "$path"
+  chmod 0644 "$path"
+  log WARN "preview-suspend: begin token=$token reason=$reason"
+  preview_kill_registered_ffmpeg "$reason"
+  printf '%s\n' "$token"
+}
+
+
+preview_suspend_end() {
+  local token="${1:-}" dir path
+  [ -n "$token" ] || return 0
+  token="$(basename -- "$token")"
+  case "$token" in
+    *[!A-Za-z0-9_.-]*)
+      log WARN "preview-suspend: invalid token ignored: $token"
+      return 1
+      ;;
+  esac
+  dir="$(preview_suspend_dir)"
+  path="$dir/$token"
+  if [ -e "$path" ]; then
+    rm -f "$path"
+    log INFO "preview-suspend: end token=$token"
+  else
+    log INFO "preview-suspend: token already absent token=$token"
+  fi
+}
+
+
+cmd_preview_suspend() {
+  require_root
+  local action="${1:-status}"
+  [ "$#" -gt 0 ] && shift || true
+
+  case "$action" in
+    begin)
+      preview_suspend_begin "${1:-manual}"
+      ;;
+    end)
+      preview_suspend_end "${1:-}"
+      ;;
+    status)
+      local dir token count=0
+      dir="$(preview_suspend_dir)"
+      if [ -d "$dir" ]; then
+        for token in "$dir"/*; do
+          [ -e "$token" ] || continue
+          count=$((count + 1))
+          printf '%s\n' "$(basename -- "$token")"
+        done
+      fi
+      [ "$count" -gt 0 ] || printf 'inactive\n'
+      ;;
+    *)
+      fail "Unknown preview-suspend action: $action"
+      ;;
+  esac
+}
+
+
+image_check_stop_gadget() {
+  if ! module_loaded g_mass_storage; then
+    log INFO "image-check: g_mass_storage ist bereits gestoppt"
+    return 0
+  fi
+
+  log WARN "image-check: stopping g_mass_storage for exclusive image check"
+  systemctl stop vdisk-relay-gadget-live.service 2>/dev/null || true
+  sync 2>/dev/null || true
+  sleep 1
+
+  if modprobe -r g_mass_storage; then
+    log INFO "image-check: g_mass_storage gestoppt"
+    return 0
+  fi
+
+  log ERROR "image-check: g_mass_storage could not be stopped"
+  return 1
+}
+
+
+image_check_restart_gadget_if_needed() {
+  local was_loaded="${1:-0}"
+  [ "$was_loaded" -eq 1 ] || return 0
+
+  if module_loaded g_mass_storage; then
+    log INFO "image-check: g_mass_storage is already loaded again"
+    return 0
+  fi
+
+  log INFO "image-check: starting g_mass_storage again"
+  systemctl start vdisk-relay-gadget-live.service 2>/dev/null || cmd_gadget_start --apply || true
+
+  if module_loaded g_mass_storage; then
+    log INFO "image-check: g_mass_storage wiederhergestellt"
+    return 0
+  fi
+
+  log ERROR "image-check: g_mass_storage could not be restored after the check"
+  return 1
+}
+
+
+fsck_command_for_fstype() {
+  local cmd
+  case "$MOUNT_FSTYPE" in
+    vfat|fat|fat32|msdos)
+      for cmd in fsck.vfat fsck.fat dosfsck; do
+        if command -v "$cmd" >/dev/null 2>&1; then
+          command -v "$cmd"
+          return 0
+        fi
+      done
+      ;;
+    *)
+      if command -v "fsck.$MOUNT_FSTYPE" >/dev/null 2>&1; then
+        command -v "fsck.$MOUNT_FSTYPE"
+        return 0
+      fi
+      ;;
+  esac
+
+  command -v fsck 2>/dev/null || return 1
+}
+
+
+run_image_fsck() {
+  local loopdev="$1" fix="$2" fsck_bin base
+  local args=()
+
+  fsck_bin="$(fsck_command_for_fstype)" || {
+    log ERROR "image-check: no fsck found for MOUNT_FSTYPE=$MOUNT_FSTYPE"
+    return 127
+  }
+  base="$(basename "$fsck_bin")"
+
+  if [ "$base" = "fsck" ]; then
+    args+=("-t" "$MOUNT_FSTYPE")
+  fi
+
+  if [ "$fix" -eq 1 ]; then
+    args+=("-a")
+  else
+    args+=("-n")
+  fi
+  args+=("$loopdev")
+
+  log INFO "image-check: filesystem check starts: $fsck_bin ${args[*]}"
+  "$fsck_bin" "${args[@]}"
+}
+
+
+fsck_result_ok() {
+  local rc="$1" fix="$2"
+  [ "$rc" -eq 0 ] && return 0
+  [ "$fix" -eq 1 ] && [ "$rc" -eq 1 ] && return 0
+  return 1
+}
+
+
+cleanup_image_check() {
+  if [ -n "${IMAGE_CHECK_PREVIEW_SUSPEND_TOKEN:-}" ]; then
+    preview_suspend_end "$IMAGE_CHECK_PREVIEW_SUSPEND_TOKEN" || true
+    IMAGE_CHECK_PREVIEW_SUSPEND_TOKEN=""
+  fi
+  if [ -n "${IMAGE_CHECK_LOOPDEV:-}" ]; then
+    losetup -d "$IMAGE_CHECK_LOOPDEV" 2>/dev/null || log WARN "image-check: loop detach failed: $IMAGE_CHECK_LOOPDEV"
+    IMAGE_CHECK_LOOPDEV=""
+  fi
+  rm -f "$RUN_DIR/image-check.active"
+  image_check_restart_gadget_if_needed "${IMAGE_CHECK_GADGET_WAS_LOADED:-0}" || true
+}
+
+
+cmd_image_check() {
+  require_root
+  ensure_dirs
+
+  local fix=0
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --fix) fix=1 ;;
+      *) fail "Unknown option for image-check: $1" ;;
+    esac
+    shift
+  done
+
+  [ -f "$IMAGE_FILE" ] || fail "Image missing: $IMAGE_FILE"
+
+  exec 8>"$RUN_DIR/image-check.lock"
+  flock -n 8 || fail "image-check lock busy: $RUN_DIR/image-check.lock"
+
+  local offset part_rc=0 fs_rc=0
+  IMAGE_CHECK_LOOPDEV=""
+  IMAGE_CHECK_GADGET_WAS_LOADED=0
+  IMAGE_CHECK_PREVIEW_SUSPEND_TOKEN=""
+  module_loaded g_mass_storage && IMAGE_CHECK_GADGET_WAS_LOADED=1
+  trap cleanup_image_check EXIT
+
+  {
+    echo "timestamp=$(date --iso-8601=seconds)"
+    echo "fix=$fix"
+  } > "$RUN_DIR/image-check.active"
+
+  IMAGE_CHECK_PREVIEW_SUSPEND_TOKEN="$(preview_suspend_begin "image-check" || true)"
+
+  image_check_stop_gadget || return 1
+  cleanup_stale_image_loops
+
+  if is_mounted "$MOUNTPOINT"; then
+    fail "Mountpoint ist noch gemountet: $MOUNTPOINT"
+  fi
+
+  log INFO "image-check: Image=$IMAGE_FILE fstype=$MOUNT_FSTYPE offset_sectors=$PARTITION_OFFSET_SECTORS fix=$fix"
+  if command -v fdisk >/dev/null 2>&1; then
+    log INFO "image-check: Partitionstabelle fdisk -l"
+    fdisk -l "$IMAGE_FILE" || true
+  fi
+
+  if command -v sfdisk >/dev/null 2>&1; then
+    log INFO "image-check: Partitionstabelle sfdisk --verify"
+    sfdisk --verify "$IMAGE_FILE"
+    part_rc=$?
+    if [ "$part_rc" -ne 0 ]; then
+      log ERROR "image-check: Partitionstabellen-Check failed rc=$part_rc"
+    fi
+  else
+    log WARN "image-check: sfdisk missing, partition-table verification skipped"
+  fi
+
+  offset=$((PARTITION_OFFSET_SECTORS * 512))
+  if [ "$fix" -eq 1 ]; then
+    IMAGE_CHECK_LOOPDEV="$(losetup --find --show --offset "$offset" "$IMAGE_FILE")" || fail "losetup failed"
+  else
+    IMAGE_CHECK_LOOPDEV="$(losetup --find --show --read-only --offset "$offset" "$IMAGE_FILE")" || fail "losetup read-only failed"
+  fi
+
+  run_image_fsck "$IMAGE_CHECK_LOOPDEV" "$fix"
+  fs_rc=$?
+  log INFO "image-check: fsck rc=$fs_rc"
+
+  if [ "$part_rc" -ne 0 ]; then
+    return "$part_rc"
+  fi
+
+  if fsck_result_ok "$fs_rc" "$fix"; then
+    log INFO "image-check: OK"
+    return 0
+  fi
+
+  log ERROR "image-check: filesystem check failed rc=$fs_rc"
+  return "$fs_rc"
+}
+
+
+cmd_sync() {
+  require_root
+  ensure_dirs
+  local do_mount=0 do_apply_rsync=0 do_send=0
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --mount) do_mount=1 ;;
+      --apply-rsync) do_apply_rsync=1 ;;
+      --send) do_send=1 ;;
+      --dry-run) ;;
+      *) fail "Unknown option for sync: $1" ;;
+    esac
+    shift
+  done
+
+  if [ "$do_mount" -eq 1 ] && module_loaded g_mass_storage; then
+    log INFO "sync: g_mass_storage remains loaded; local access is read-only in parallel with the gadget"
+  fi
+
+  exec 9>"$RUN_DIR/sync.lock"
+  flock -n 9 || fail "sync lock busy: $RUN_DIR/sync.lock"
+
+  log INFO "sync start mode_mount=$do_mount mode_apply_rsync=$do_apply_rsync mode_send=$do_send"
+  trace_event_with_pending sync_started source=sync mode_mount="$do_mount" mode_apply_rsync="$do_apply_rsync" mode_send="$do_send"
+
+  if [ "$do_mount" -ne 1 ]; then
+    log INFO "dry-run without mount. Only /files is inspected."
+    cmd_notify_data $([ "$do_send" -eq 1 ] && echo --send || echo --dry-run)
+    return $?
+  fi
+
+  local loopdev="" rsync_rc notify_rc rsync_out rsync_candidates candidate_count
+  local -a rsync_opts=()
+  rsync_out="$RUN_DIR/rsync-output.last"
+  rsync_candidates="$RUN_DIR/rsync-candidates.last"
+  : > "$rsync_out"
+  : > "$rsync_candidates"
+  cleanup_stale_image_loops
+
+  local mount_start
+  mount_start="$(now_ms)"
+  trace_event shadow_mount_started source=sync image="$IMAGE_FILE" mountpoint="$MOUNTPOINT"
+  if ! loopdev="$(shadow_mount)"; then
+    log ERROR "shadow_mount failed; rsync/notify skipped"
+    trace_event shadow_mount_done source=sync rc=1 duration_ms="$(duration_since_ms "$mount_start")"
+    cleanup_stale_image_loops
+    return 1
+  fi
+  trace_event shadow_mount_done source=sync rc=0 loopdev="$loopdev" duration_ms="$(duration_since_ms "$mount_start")"
+
+  trap 'shadow_umount "${loopdev:-}"; cleanup_stale_image_loops' EXIT
+
+  if [ "$do_apply_rsync" -eq 1 ]; then
+    IFS=' ' read -r -a rsync_opts <<< "$SYNC_RSYNC_OPTIONS"
+    log WARN "APPLY-RSYNC: writing new files from $MOUNTPOINT to $DATA_ROOT (opts=$SYNC_RSYNC_OPTIONS)"
+    local rsync_start
+    rsync_start="$(now_ms)"
+    trace_event rsync_started source=sync mode=apply opts="$SYNC_RSYNC_OPTIONS" from="$MOUNTPOINT" to="$DATA_ROOT"
+    rsync "${rsync_opts[@]}" --out-format='vdisk-relay-rsync:%n' "$MOUNTPOINT"/ "$DATA_ROOT"/ > "$rsync_out" 2>&1
+    rsync_rc=$?
+    rsync_output_to_candidates "$rsync_out" "$rsync_candidates" "$MOUNTPOINT" "$DATA_ROOT"
+  else
+    IFS=' ' read -r -a rsync_opts <<< "$SYNC_RSYNC_DRYRUN_OPTIONS"
+    log INFO "RSYNC-DRY-RUN: no write operation to $DATA_ROOT (opts=$SYNC_RSYNC_DRYRUN_OPTIONS)"
+    local rsync_start
+    rsync_start="$(now_ms)"
+    trace_event rsync_started source=sync mode=dry-run opts="$SYNC_RSYNC_DRYRUN_OPTIONS" from="$MOUNTPOINT" to="$DATA_ROOT"
+    rsync "${rsync_opts[@]}" --out-format='vdisk-relay-rsync:%n' "$MOUNTPOINT"/ "$DATA_ROOT"/ > "$rsync_out" 2>&1
+    rsync_rc=$?
+  fi
+  candidate_count="$(line_count "$rsync_candidates")"
+  log INFO "rsync done rc=$rsync_rc candidates=$candidate_count output=$rsync_out candidate_list=$rsync_candidates"
+  trace_event rsync_done source=sync rc="$rsync_rc" candidates="$candidate_count" output="$rsync_out" candidate_list="$rsync_candidates" duration_ms="$(duration_since_ms "$rsync_start")"
+
+  shadow_umount "$loopdev"
+  cleanup_stale_image_loops
+  trap - EXIT
+
+  if [ "$rsync_rc" -ne 0 ]; then
+    log ERROR "rsync failed rc=$rsync_rc"
+    tail -n 20 "$rsync_out" 2>/dev/null | while IFS= read -r line; do
+      log ERROR "rsync output: $line"
+    done
+    return "$rsync_rc"
+  fi
+
+  if [ "$do_apply_rsync" -eq 1 ] && [ "$candidate_count" -gt 0 ]; then
+    cmd_notify_data $([ "$do_send" -eq 1 ] && echo --send || echo --dry-run) --candidate-list "$rsync_candidates"
+  else
+    [ "$do_apply_rsync" -eq 1 ] && log INFO "sync: no rsync candidates, notify uses scan fallback"
+    cmd_notify_data $([ "$do_send" -eq 1 ] && echo --send || echo --dry-run)
+  fi
+  notify_rc=$?
+  if [ "$notify_rc" -ne 0 ]; then
+    log ERROR "notify-data failed rc=$notify_rc"
+    trace_event sync_done source=sync rc="$notify_rc" phase=notify pending=kept
+    return "$notify_rc"
+  fi
+
+  log INFO "sync done"
+  trace_event sync_done source=sync rc=0 pending=unchanged
+  return 0
+}
+
+
+cmd_trigger() {
+  require_root
+  ensure_dirs
+  local trace_id image_mtime trigger_source
+  trigger_source="manual-trigger"
+
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --source)
+        shift
+        trigger_source="${1:-manual-trigger}"
+        ;;
+      --source=*)
+        trigger_source="${1#--source=}"
+        ;;
+      *)
+        fail "Unknown option for trigger: $1"
+        ;;
+    esac
+    shift
+  done
+
+  case "$trigger_source" in
+    *[!A-Za-z0-9_.:-]*|"") trigger_source="manual-trigger" ;;
+  esac
+
+  trace_id="$(trace_new_id)"
+  image_mtime="$(stat -c '%Y' "$IMAGE_FILE" 2>/dev/null || true)"
+  TRACE_ID="$trace_id" trace_event image_change_detected source=trigger trigger_source="$trigger_source" image="$IMAGE_FILE" image_mtime="${image_mtime:-}"
+  {
+    echo "timestamp=$(date --iso-8601=seconds)"
+    echo "source=$trigger_source"
+    echo "trigger_source=$trigger_source"
+    echo "trace_id=$trace_id"
+    echo "image_mtime=${image_mtime:-}"
+    echo "legacy_motion_lock=$([ -f /tmp/motion.lock ] && echo present || echo absent)"
+  } > "$RUN_DIR/pending"
+  log INFO "pending state set: $RUN_DIR/pending source=$trigger_source trace_id=$trace_id"
+  TRACE_ID="$trace_id" trace_event pending_written source=trigger trigger_source="$trigger_source" file="$RUN_DIR/pending" image="$IMAGE_FILE"
+}
+
+cmd_post_trigger() {
+  require_root
+  ensure_dirs
+
+  local unit
+  if [ "${ULTRA_FAST_LANE_ENABLED:-0}" = "1" ]; then
+    unit="vdisk-relay-ultra-fast-sync.service"
+    log INFO "post-trigger: Ultra Fast Lane active, starting $unit"
+    trace_event_with_pending dispatch_after_trigger source=post-trigger lane=ultra unit="$unit"
+  else
+    unit="vdisk-relay-fast-sync.service"
+    log INFO "post-trigger: Ultra Fast Lane off, starting $unit"
+    trace_event_with_pending dispatch_after_trigger source=post-trigger lane=fast unit="$unit"
+  fi
+
+  command -v systemctl >/dev/null 2>&1 || return 0
+  systemctl start --no-block "$unit" >/dev/null 2>&1 || true
+}
+
+cmd_retry() {
+  require_root
+  ensure_dirs
+  local do_mount=0
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --mount) do_mount=1 ;;
+      *) fail "Unknown option for retry: $1" ;;
+    esac
+    shift
+  done
+  if [ ! -f "$RUN_DIR/pending" ]; then
+    log INFO "No new pending state. Nothing to do."
+    return 0
+  fi
+  trace_event_with_pending retry_started source=retry mode_mount="$do_mount"
+  if [ "$do_mount" -eq 1 ]; then
+    cmd_sync --mount
+  else
+    cmd_sync
+  fi
+}
+
+
+cmd_live_sync() {
+  require_root
+  ensure_dirs
+
+  if image_check_active; then
+    log WARN "live-sync: image-check active, run skipped"
+    return 0
+  fi
+
+  local force=0 fast=0
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --force) force=1 ;;
+      --fast) fast=1 ;;
+      *) fail "Unknown option for live-sync: $1" ;;
+    esac
+    shift
+  done
+
+  if [ ! -f "$RUN_DIR/pending" ] && [ "$force" -ne 1 ]; then
+    log INFO "live-sync: no pending state. Nothing to do."
+    return 0
+  fi
+
+  [ -f "$IMAGE_FILE" ] || fail "Image missing: $IMAGE_FILE"
+
+  local now mtime age quiet_required mode
+  mode="normal"
+  quiet_required="$(int_value_or_default "${LIVE_QUIET_SECONDS:-8}" 8 0 "")"
+  if [ "$fast" -eq 1 ]; then
+    mode="fast"
+    quiet_required="$(int_value_or_default "${LIVE_FAST_QUIET_SECONDS:-3}" 3 1 "")"
+  fi
+
+  now="$(date +%s)"
+  mtime="$(stat -c '%Y' "$IMAGE_FILE")"
+  age=$((now - mtime))
+  trace_event_with_pending quiet_check source=live-sync mode="$mode" age_seconds="$age" required_seconds="$quiet_required"
+
+  if [ "$force" -ne 1 ] && [ "$age" -lt "$quiet_required" ]; then
+    log INFO "live-sync: image is not quiet enough mode=${mode} age=${age}s required=${quiet_required}s"
+    return 0
+  fi
+
+  exec 7>"$RUN_DIR/live-sync.lock"
+  if ! flock -n 7; then
+    if [ "$fast" -eq 1 ]; then
+      log INFO "live-sync: lock busy mode=fast, run skipped"
+      return 0
+    fi
+    fail "live-sync lock busy: $RUN_DIR/live-sync.lock"
+  fi
+
+  log INFO "live-sync: start mode=${mode} force=${force}"
+  trace_event_with_pending live_sync_started source=live-sync mode="$mode" force="$force"
+
+  if module_loaded g_mass_storage; then
+    log INFO "live-sync: g_mass_storage remains loaded; local access is read-only"
+  else
+    log WARN "live-sync: g_mass_storage is not loaded"
+  fi
+
+  local rc=0
+  cmd_sync --mount --apply-rsync --send
+  rc=$?
+
+  if [ "$rc" -eq 0 ]; then
+    rm -f "$RUN_DIR/pending"
+    log INFO "live-sync: successful, pending state removed"
+    trace_event sync_done source=live-sync rc=0 pending=removed
+  else
+    log ERROR "live-sync: sync rc=$rc, pending state kept"
+    trace_event sync_done source=live-sync rc="$rc" pending=kept
+  fi
+
+  return "$rc"
+}
+
+cmd_fast_sync() {
+  require_root
+  ensure_dirs
+
+  if [ "${LIVE_FAST_LANE_ENABLED:-1}" != "1" ]; then
+    log INFO "fast-sync: disabled by LIVE_FAST_LANE_ENABLED=${LIVE_FAST_LANE_ENABLED:-}"
+    return 0
+  fi
+
+  if [ ! -f "$RUN_DIR/pending" ]; then
+    log INFO "fast-sync: no pending state. Nothing to do."
+    return 0
+  fi
+
+  exec 6>"$RUN_DIR/fast-sync.lock"
+  flock -n 6 || {
+    log INFO "fast-sync: lock busy, run skipped"
+    return 0
+  }
+
+  if [ ! -f "$RUN_DIR/pending" ]; then
+    log INFO "fast-sync: pending state was already processed"
+    return 0
+  fi
+
+  local delay
+  trace_event_with_pending fast_sync_started source=fast-sync delay_seconds="${LIVE_FAST_LANE_DELAY_SECONDS:-3}" quiet_seconds="${LIVE_FAST_QUIET_SECONDS:-3}"
+  delay="$(int_value_or_default "${LIVE_FAST_LANE_DELAY_SECONDS:-3}" 3 0 "")"
+  if [ "$delay" -gt 0 ]; then
+    log INFO "fast-sync: waiting ${delay}s before fast-lane attempt"
+    trace_event_with_pending fast_sync_delay source=fast-sync delay_seconds="$delay"
+    sleep "$delay"
+  fi
+
+  if [ ! -f "$RUN_DIR/pending" ]; then
+    log INFO "fast-sync: pending state was processed during delay"
+    return 0
+  fi
+
+  cmd_live_sync --fast
+}
+
+cmd_ultra_fast_sync() {
+  require_root
+  ensure_dirs
+
+  if [ "${ULTRA_FAST_LANE_ENABLED:-0}" != "1" ]; then
+    log INFO "ultra-fast-sync: disabled by ULTRA_FAST_LANE_ENABLED=${ULTRA_FAST_LANE_ENABLED:-}"
+    return 0
+  fi
+
+  if image_check_active; then
+    log WARN "ultra-fast-sync: image-check active, run skipped"
+    trace_event ultra_done source=ultra-fast-sync rc=0 pending=kept reason=image-check-active
+    return 0
+  fi
+
+  if [ ! -f "$RUN_DIR/pending" ]; then
+    log INFO "ultra-fast-sync: no pending state. Nothing to do."
+    return 0
+  fi
+
+  exec 6>"$RUN_DIR/ultra-fast-sync.lock"
+  flock -n 6 || {
+    log INFO "ultra-fast-sync: lock busy, run skipped"
+    return 0
+  }
+
+  exec 7>"$RUN_DIR/live-sync.lock"
+  flock -n 7 || {
+    log INFO "ultra-fast-sync: live-sync lock busy, run skipped"
+    return 0
+  }
+
+  local delay quiet_required now mtime age mode sync_after queue_enabled queue_delay
+  mode="${ULTRA_FAST_DUPLICATE_MODE:-filename}"
+  case "$mode" in
+    filename|strict|off) ;;
+    *) mode="filename" ;;
+  esac
+  sync_after="$(int_value_or_default "${ULTRA_FAST_LANE_SYNC_AFTER_SEND:-1}" "1" "0" "1")"
+  queue_enabled="$(int_value_or_default "${ULTRA_FAST_REMAINDER_QUEUE_ENABLED:-1}" "1" "0" "1")"
+  queue_delay="$(int_value_or_default "${ULTRA_FAST_REMAINDER_QUEUE_DELAY_SECONDS:-2}" "2" "0" "3600")"
+  trace_event_with_pending ultra_started source=ultra-fast-sync duplicate_mode="$mode" sync_after_send="$sync_after" queue_enabled="$queue_enabled" queue_delay_seconds="$queue_delay"
+
+  delay="$(int_value_or_default "${ULTRA_FAST_LANE_DELAY_SECONDS:-0}" "0" "0" "3600")"
+  if [ "$delay" -gt 0 ]; then
+    log INFO "ultra-fast-sync: waiting ${delay}s before ultra attempt"
+    trace_event ultra_delay source=ultra-fast-sync delay_seconds="$delay"
+    sleep "$delay"
+  fi
+
+  if [ ! -f "$RUN_DIR/pending" ]; then
+    log INFO "ultra-fast-sync: pending state was processed during delay"
+    return 0
+  fi
+
+  [ -f "$IMAGE_FILE" ] || fail "Image missing: $IMAGE_FILE"
+  quiet_required="$(int_value_or_default "${ULTRA_FAST_LANE_QUIET_SECONDS:-0}" "0" "0" "3600")"
+  now="$(date +%s)"
+  mtime="$(stat -c '%Y' "$IMAGE_FILE")"
+  age=$((now - mtime))
+  trace_event_with_pending quiet_check source=ultra-fast-sync mode=ultra age_seconds="$age" required_seconds="$quiet_required"
+  if [ "$age" -lt "$quiet_required" ]; then
+    log INFO "ultra-fast-sync: image is not quiet enough age=${age}s required=${quiet_required}s"
+    trace_event ultra_done source=ultra-fast-sync rc=0 pending=kept reason=quiet-check
+    return 0
+  fi
+
+  local loopdev="" mount_start latest_dir entry id enabled pattern last_file bot_var chat_var retries wait tmp_log
+  local candidate token chat rc failures candidates sent skipped rsync_rc rsync_out rsync_candidates candidate_count
+  local rsync_start duration sync_required_failed
+  local queue_file queue_sorted skipped_file queue_count send_index candidate_mtime
+  local preview_suspend_token=""
+  local -a sent_state_updates=()
+  failures=0
+  candidates=0
+  sent=0
+  skipped=0
+  rsync_rc=0
+  sync_required_failed=0
+  rsync_out="$RUN_DIR/ultra-rsync-output.last"
+  rsync_candidates="$RUN_DIR/ultra-rsync-candidates.last"
+  queue_file="$RUN_DIR/ultra-send-queue.$$"
+  queue_sorted="$RUN_DIR/ultra-send-queue.sorted.$$"
+  skipped_file="$RUN_DIR/ultra-send-skipped.$$"
+  : > "$rsync_out"
+  : > "$rsync_candidates"
+  : > "$queue_file"
+  : > "$queue_sorted"
+  : > "$skipped_file"
+
+  cleanup_stale_image_loops
+  mount_start="$(now_ms)"
+  trace_event shadow_mount_started source=ultra-fast-sync image="$IMAGE_FILE" mountpoint="$MOUNTPOINT"
+  if ! loopdev="$(shadow_mount)"; then
+    log ERROR "ultra-fast-sync: shadow_mount failed"
+    trace_event shadow_mount_done source=ultra-fast-sync rc=1 duration_ms="$(duration_since_ms "$mount_start")"
+    cleanup_stale_image_loops
+    rm -f "$queue_file" "$queue_sorted" "$skipped_file"
+    return 1
+  fi
+  trace_event shadow_mount_done source=ultra-fast-sync rc=0 loopdev="$loopdev" duration_ms="$(duration_since_ms "$mount_start")"
+  trap 'preview_suspend_end "${preview_suspend_token:-}" || true; shadow_umount "${loopdev:-}"; cleanup_stale_image_loops; rm -f "${queue_file:-}" "${queue_sorted:-}" "${skipped_file:-}"' EXIT
+
+  for entry in "${SOURCES[@]}"; do
+    [[ "$entry" =~ ^[[:space:]]*# ]] && continue
+    source_parse_entry "$entry"; id="$SRC_ID"; enabled="$SRC_ENABLED"; profile="$SRC_PROFILE"; label="$SRC_LABEL"; pattern="$SRC_MATCH"; extensions="$SRC_EXTENSIONS"; telegram_mode="$SRC_TELEGRAM_MODE"; last_file="$SRC_LAST_FILE"; bot_var="$SRC_BOT_VAR"; chat_var="$SRC_CHAT_VAR"; retries="$SRC_RETRIES"; wait="$SRC_WAIT"; tmp_log="$SRC_TMP_LOG"
+    [ "${enabled:-0}" = "1" ] || continue
+
+    latest_dir="$(source_latest_dir_for_root "$MOUNTPOINT" "$profile" 2>/dev/null || true)"
+    if [ -z "$latest_dir" ]; then
+      log WARN "ultra-fast-sync: no source directory found in image source=$id profile=$profile"
+      trace_event ultra_source_skipped source=ultra-fast-sync source_id="$id" profile="$profile" reason=no-source-dir
+      continue
+    fi
+
+    ultra_collect_source_queue "$latest_dir" "$id" "$pattern" "$extensions" "$telegram_mode" "$last_file" "$bot_var" "$chat_var" "$retries" "$wait" "$tmp_log" "$mode" "$queue_file" "$skipped_file"
+  done
+
+  if [ "$queue_enabled" -ne 1 ]; then
+    if [ -s "$queue_file" ]; then
+      sort -t '|' -k1,1nr -k2,2 "$queue_file" | head -n1 > "$queue_sorted"
+      log WARN "ultra-fast-sync: ultra remainder queue disabled, sending only newest candidate"
+      trace_event ultra_queue_limited source=ultra-fast-sync reason=disabled limit=1
+    fi
+  elif [ -s "$queue_file" ]; then
+    sort -t '|' -k1,1n -k2,2 "$queue_file" > "$queue_sorted"
+  fi
+
+  queue_count="$(line_count "$queue_sorted")"
+  skipped="$(line_count "$skipped_file")"
+  candidates=$((queue_count + skipped))
+  trace_event ultra_queue_built source=ultra-fast-sync queued="$queue_count" skipped="$skipped" delay_seconds="$queue_delay" order=fifo
+
+  if [ "$queue_count" -gt 0 ]; then
+    preview_suspend_token="$(preview_suspend_begin "ultra-fast-send" || true)"
+  fi
+
+  send_index=0
+  while IFS='|' read -r candidate_mtime candidate id last_file bot_var chat_var retries wait tmp_log telegram_mode; do
+    [ -n "$candidate" ] || continue
+    if [ "$send_index" -gt 0 ] && [ "$queue_delay" -gt 0 ]; then
+      log INFO "ultra-fast-sync: FIFO delay ${queue_delay}s before next ultra send"
+      trace_event ultra_queue_delay source=ultra-fast-sync delay_seconds="$queue_delay" next_file="$candidate" index="$send_index"
+      sleep "$queue_delay"
+    fi
+
+    trace_event candidate_found source=ultra-fast-sync source_id="$id" file="$candidate" candidate_source=image-mount-fifo basename="$(basename "$candidate")" queue_index="$send_index" file_mtime="$candidate_mtime"
+
+    token="${!bot_var:-}"
+    chat="${!chat_var:-}"
+    if [ -z "$token" ] || [ -z "$chat" ]; then
+      failures=$((failures + 1))
+      log ERROR "ultra-fast-sync: Telegram credentials missing source=$id"
+      trace_event telegram_send_failed source=ultra-fast-sync source_id="$id" file="$candidate" rc=12 reason=credentials-missing queue_index="$send_index"
+      send_index=$((send_index + 1))
+      continue
+    fi
+
+    log INFO "ULTRA-SEND source=$id index=$send_index file=$candidate duplicate_mode=$mode"
+    TRACE_SOURCE="$id" TRACE_SEND_SOURCE="ultra-fast-sync" send_telegram_file "$token" "$chat" "$candidate" "$retries" "$wait" "$tmp_log" "$chat_var" "$telegram_mode"
+    rc=$?
+    if [ "$rc" -eq 0 ]; then
+      if write_send_state "$id" "$candidate" "ultra-image-send" "$last_file" "$mode"; then
+        sent=$((sent + 1))
+        sent_state_updates+=("${id}|${candidate}|${last_file}")
+        log INFO "ULTRA-SEND-OK source=$id send_state_updated=$(send_state_file "$id")"
+        trace_event send_state_written source=ultra-fast-sync source_id="$id" file="$candidate" duplicate_mode="$mode" result=ok
+      else
+        failures=$((failures + 1))
+        log ERROR "ULTRA-SEND-OK-STATE-FAILED source=$id"
+        trace_event send_state_written source=ultra-fast-sync source_id="$id" file="$candidate" duplicate_mode="$mode" result=failed
+      fi
+    else
+      failures=$((failures + 1))
+      log ERROR "ULTRA-SEND-FAILED source=$id rc=$rc"
+    fi
+    send_index=$((send_index + 1))
+  done < "$queue_sorted"
+
+  if [ -n "$preview_suspend_token" ]; then
+    preview_suspend_end "$preview_suspend_token" || true
+    preview_suspend_token=""
+  fi
+
+  if [ "$sync_after" -eq 1 ]; then
+    local -a rsync_opts=()
+    IFS=' ' read -r -a rsync_opts <<< "$SYNC_RSYNC_OPTIONS"
+    log WARN "ULTRA-RSYNC-AFTER-SEND: writing new files from $MOUNTPOINT to $DATA_ROOT (opts=$SYNC_RSYNC_OPTIONS)"
+    rsync_start="$(now_ms)"
+    trace_event rsync_started source=ultra-fast-sync mode=apply-after-send opts="$SYNC_RSYNC_OPTIONS" from="$MOUNTPOINT" to="$DATA_ROOT"
+    rsync "${rsync_opts[@]}" --out-format='vdisk-relay-rsync:%n' "$MOUNTPOINT"/ "$DATA_ROOT"/ > "$rsync_out" 2>&1
+    rsync_rc=$?
+    rsync_output_to_candidates "$rsync_out" "$rsync_candidates" "$MOUNTPOINT" "$DATA_ROOT"
+    candidate_count="$(line_count "$rsync_candidates")"
+    duration="$(duration_since_ms "$rsync_start")"
+    log INFO "ultra-fast-sync: rsync-after-send done rc=$rsync_rc candidates=$candidate_count output=$rsync_out"
+    trace_event rsync_done source=ultra-fast-sync rc="$rsync_rc" candidates="$candidate_count" output="$rsync_out" candidate_list="$rsync_candidates" duration_ms="$duration"
+    [ "$rsync_rc" -ne 0 ] && sync_required_failed=1
+    if [ "$rsync_rc" -eq 0 ] && [ "${#sent_state_updates[@]}" -gt 0 ]; then
+      local update item update_id update_candidate update_last_file rel local_candidate
+      for item in "${sent_state_updates[@]}"; do
+        IFS='|' read -r update_id update_candidate update_last_file <<< "$item"
+        rel="$(file_rel_path "$update_candidate")"
+        local_candidate="$DATA_ROOT/$rel"
+        [ -f "$local_candidate" ] || continue
+        if write_send_state "$update_id" "$local_candidate" "ultra-image-send-local" "$update_last_file" "$mode"; then
+          trace_event send_state_written source=ultra-fast-sync source_id="$update_id" file="$local_candidate" duplicate_mode="$mode" result=localized
+        fi
+      done
+    fi
+  fi
+
+  shadow_umount "$loopdev"
+  cleanup_stale_image_loops
+  rm -f "$queue_file" "$queue_sorted" "$skipped_file"
+  trap - EXIT
+
+  if [ "$candidates" -eq 0 ]; then
+    log WARN "ultra-fast-sync: no candidate found, pending remains for fallback"
+    trace_event ultra_done source=ultra-fast-sync rc=0 pending=kept reason=no-candidates-fallback
+    return 0
+  fi
+
+  if [ "$failures" -gt 0 ]; then
+    log ERROR "ultra-fast-sync: failures=$failures, pending remains for fallback"
+    trace_event ultra_done source=ultra-fast-sync rc=1 pending=kept failures="$failures" sent="$sent" skipped="$skipped"
+    return 1
+  fi
+
+  if [ "$sync_required_failed" -ne 0 ]; then
+    log ERROR "ultra-fast-sync: rsync-after-send failed rc=$rsync_rc, Pending bleibt"
+    trace_event ultra_done source=ultra-fast-sync rc="$rsync_rc" pending=kept failures=0 sent="$sent" skipped="$skipped"
+    return "$rsync_rc"
+  fi
+
+  rm -f "$RUN_DIR/pending"
+  log INFO "ultra-fast-sync: successful, pending state removed sent=$sent skipped=$skipped"
+  trace_event ultra_done source=ultra-fast-sync rc=0 pending=removed sent="$sent" skipped="$skipped"
+  return 0
+}
+
+
+cmd_watch() {
+  require_root
+  ensure_dirs
+  command -v inotifywait >/dev/null 2>&1 || fail "inotifywait missing"
+  log INFO "Shadow watcher starts for $IMAGE_FILE event=$WATCH_EVENT"
+  while inotifywait -q -e "$WATCH_EVENT" "$IMAGE_FILE"; do
+    sleep "$WATCH_DEBOUNCE_SECONDS"
+    cmd_trigger --source=cli-watch
+    cmd_post_trigger
+  done
+}
+
+
+
+
+cmd_archive() {
+  require_root
+  ensure_dirs
+
+  local apply=0
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --apply) apply=1 ;;
+      --dry-run) apply=0 ;;
+      *) fail "Unknown option for archive: $1" ;;
+    esac
+    shift
+  done
+
+  [ -d "$DATA_ROOT" ] || fail "DATA_ROOT missing: $DATA_ROOT"
+  [ -r "$ARCHIVE_RSYNC_PASSWORD_FILE" ] || fail "rsync password file missing/not readable: $ARCHIVE_RSYNC_PASSWORD_FILE"
+
+  exec 8>"$RUN_DIR/archive.lock"
+  flock -n 8 || {
+    log WARN "archive lock busy, run skipped"
+    return 0
+  }
+
+  local rc
+  local opts=(
+    -r
+    --ignore-existing
+    --contimeout="$ARCHIVE_RSYNC_CONTIMEOUT"
+    --timeout="$ARCHIVE_RSYNC_TIMEOUT"
+    --password-file="$ARCHIVE_RSYNC_PASSWORD_FILE"
+  )
+
+  if [ "$apply" -eq 1 ]; then
+    log WARN "ARCHIVE APPLY RSYNCD: $DATA_ROOT/ -> $ARCHIVE_RSYNC_TARGET"
+    timeout --kill-after=10s "$ARCHIVE_RSYNC_MAX_SECONDS" \
+      rsync "${opts[@]}" "$DATA_ROOT"/ "$ARCHIVE_RSYNC_TARGET"
+    rc=$?
+  else
+    log INFO "ARCHIVE DRY-RUN RSYNCD: $DATA_ROOT/ -> $ARCHIVE_RSYNC_TARGET"
+    timeout --kill-after=10s "$ARCHIVE_RSYNC_MAX_SECONDS" \
+      rsync -n --stats "${opts[@]}" "$DATA_ROOT"/ "$ARCHIVE_RSYNC_TARGET"
+    rc=$?
+  fi
+
+  if [ "$rc" -ne 0 ]; then
+    log ERROR "ARCHIVE: rsync-daemon failed rc=$rc"
+    return "$rc"
+  fi
+
+  return 0
+}
+
+
+
+
+cmd_health() {
+  local do_send=0 do_reboot=0 max_age="$MAX_DATA_AGE_SECONDS" explicit_file=""
+  local best_file="" best_mtime=0 best_source_id="" best_source_origin=""
+  local now age msg token chat chat_var
+
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --send) do_send=1 ;;
+      --reboot) do_reboot=1 ;;
+      --file) shift; explicit_file="${1:-}" ;;
+      --max-age) shift; max_age="${1:-}" ;;
+      *) fail "Unknown option for health: $1" ;;
+    esac
+    shift
+  done
+
+  consider_data_file() {
+    local source_id="$1" origin="$2" file="$3" mtime
+    [ -n "$file" ] || return 0
+    [ -s "$file" ] || return 0
+
+    mtime="$(stat -c '%Y' "$file" 2>/dev/null || echo 0)"
+    [ "$mtime" -gt 0 ] || return 0
+
+    if [ "$mtime" -gt "$best_mtime" ]; then
+      best_mtime="$mtime"
+      best_file="$file"
+      best_source_id="$source_id"
+      best_source_origin="$origin"
+    fi
+  }
+
+  if [ -n "$explicit_file" ]; then
+    consider_data_file "explicit" "file-argument" "$explicit_file"
+  else
+    local latest_dir="" entry id enabled profile label pattern extensions telegram_mode last_file bot_var chat_var retries wait tmp_log candidate
+    for entry in "${SOURCES[@]}"; do
+      [[ "$entry" =~ ^[[:space:]]*# ]] && continue
+      source_parse_entry "$entry"; id="$SRC_ID"; enabled="$SRC_ENABLED"; profile="$SRC_PROFILE"; label="$SRC_LABEL"; pattern="$SRC_MATCH"; extensions="$SRC_EXTENSIONS"; telegram_mode="$SRC_TELEGRAM_MODE"; last_file="$SRC_LAST_FILE"; bot_var="$SRC_BOT_VAR"; chat_var="$SRC_CHAT_VAR"; retries="$SRC_RETRIES"; wait="$SRC_WAIT"; tmp_log="$SRC_TMP_LOG"
+
+      [ "${enabled:-0}" = "1" ] || continue
+
+      latest_dir="$(source_latest_dir_for_root "$DATA_ROOT" "$profile" 2>/dev/null || true)"
+      if [ -n "$latest_dir" ]; then
+        candidate="$(latest_file_matching "$latest_dir" "$pattern" "$extensions" 2>/dev/null || true)"
+        consider_data_file "$id" "data-root" "$candidate"
+      fi
+    done
+  fi
+
+  if [ -z "$best_file" ]; then
+    echo "CRITICAL newest_file=NONE active_sources_checked=1"
+    return 2
+  fi
+
+  now="$(date +%s)"
+  age=$((now - best_mtime))
+
+  if [ "$age" -lt "$max_age" ]; then
+    echo "OK newest_file=\"$best_file\" source_id=$best_source_id source=$best_source_origin age_seconds=$age max_seconds=$max_age"
+    return 0
+  fi
+
+  msg="The newest file is older than the configured health threshold. The data system will now restart."
+  echo "STALE newest_file=\"$best_file\" source_id=$best_source_id source=$best_source_origin age_seconds=$age max_seconds=$max_age action_send=$do_send action_reboot=$do_reboot"
+
+  if [ "$do_send" -eq 1 ]; then
+    IFS='|' read -r token chat chat_var <<< "$(first_telegram_credentials || true)"
+    send_telegram_text "$token" "$chat" "$msg" "$chat_var" || log ERROR "health: Telegram send failed"
+  fi
+
+  if [ "$do_reboot" -eq 1 ]; then
+    log WARN "health: --reboot is disabled; reboot is only handled via image-watchdog --reboot-stale"
+  fi
+
+  return 2
+}
+
+
+
+wait_for_telegram_dns() {
+  local max="${BOOT_NOTIFY_WAIT_SECONDS:-180}"
+  local interval="${BOOT_NOTIFY_WAIT_INTERVAL:-5}"
+  local waited=0
+
+  while [ "$waited" -lt "$max" ]; do
+    if getent hosts api.telegram.org >/dev/null 2>&1; then
+      log INFO "boot-notify: DNS for api.telegram.org available after ${waited}s"
+      return 0
+    fi
+
+    log WARN "boot-notify: DNS not ready yet, waiting ${interval}s"
+    sleep "$interval"
+    waited=$((waited + interval))
+  done
+
+  log WARN "boot-notify: DNS for api.telegram.org unavailable after ${max}s"
+  return 1
+}
+
+
+cmd_boot_notify() {
+  local do_send=0 reason text token chat chat_var
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --send) do_send=1 ;;
+      --dry-run) do_send=0 ;;
+      *) fail "Unknown option for boot-notify: $1" ;;
+    esac
+    shift
+  done
+  if [ -f /etc/restart.reason ]; then
+    reason="$(cat /etc/restart.reason 2>/dev/null)"
+  else
+    reason="Unexpected reboot!"
+  fi
+  text=$'VDisk Relay is now operational.\n<b>Reboot Reason:</b>\n'"${reason}"
+  if [ "$do_send" -ne 1 ]; then
+    echo "DRY-RUN boot-notify text=$text"
+    return 0
+  fi
+
+  if [ ! -f /etc/vdisk-relay.allow-boot-notify ]; then
+    log WARN "boot-notify: disabled, file /etc/vdisk-relay.allow-boot-notify missing"
+    return 0
+  fi
+
+  wait_for_telegram_dns || true
+
+  IFS='|' read -r token chat chat_var <<< "$(boot_notify_credentials || true)"
+  if [ -z "$token" ] || [ -z "$chat" ]; then
+    log WARN "boot-notify: no Telegram credentials found (boot notify not configured or incomplete)"
+    return 0
+  fi
+
+  send_telegram_text "$token" "$chat" "$text" "$chat_var"
+}
+
+cmd_gadget_status() {
+  echo "g_mass_storage_loaded=$(module_loaded g_mass_storage && echo yes || echo no)"
+  echo "dwc2_loaded=$(module_loaded dwc2 && echo yes || echo no)"
+  echo "libcomposite_loaded=$(module_loaded libcomposite && echo yes || echo no)"
+  echo "image=$IMAGE_FILE exists=$([ -f "$IMAGE_FILE" ] && echo yes || echo no)"
+  [ -f "$IMAGE_FILE" ] && stat -c 'image_size=%s image_mtime=%y' "$IMAGE_FILE"
+  return 0
+}
+
+
+cmd_gadget_watchdog() {
+  require_root
+  ensure_dirs
+
+  if image_check_active; then
+    log WARN "gadget-watchdog: image-check active, gadget restore skipped"
+    return 0
+  fi
+
+  local fail=0 warn=0 bound_file loop_lines dev recent_kernel
+
+  log INFO "gadget-watchdog: check start"
+
+  if [ ! -f "$IMAGE_FILE" ]; then
+    log ERROR "gadget-watchdog: image missing: $IMAGE_FILE"
+    return 2
+  fi
+
+  if ! module_loaded dwc2; then
+    log WARN "gadget-watchdog: dwc2 not loaded, trying modprobe dwc2"
+    modprobe dwc2 2>/dev/null || true
+    module_loaded dwc2 || warn=1
+  fi
+
+  if ! module_loaded libcomposite; then
+    log WARN "gadget-watchdog: libcomposite not loaded, trying modprobe libcomposite"
+    modprobe libcomposite 2>/dev/null || true
+    module_loaded libcomposite || warn=1
+  fi
+
+  if ! module_loaded g_mass_storage; then
+    log ERROR "gadget-watchdog: g_mass_storage not loaded; starting vdisk-relay-gadget-live.service"
+    systemctl start vdisk-relay-gadget-live.service
+    sleep 2
+
+    if module_loaded g_mass_storage; then
+      log INFO "gadget-watchdog: g_mass_storage restored"
+    else
+      log ERROR "gadget-watchdog: g_mass_storage still missing after start"
+      return 2
+    fi
+  fi
+
+  if [ -r /sys/module/g_mass_storage/parameters/file ]; then
+    bound_file="$(cat /sys/module/g_mass_storage/parameters/file 2>/dev/null || true)"
+    case "$bound_file" in
+      *"$IMAGE_FILE"*)
+        log INFO "gadget-watchdog: backing image OK: $bound_file"
+        ;;
+      *)
+        log ERROR "gadget-watchdog: backing image mismatch: $bound_file expected=$IMAGE_FILE"
+        fail=1
+        ;;
+    esac
+  else
+    log WARN "gadget-watchdog: cannot read g_mass_storage backing file parameter"
+    warn=1
+  fi
+
+  if is_mounted "$MOUNTPOINT"; then
+    log WARN "gadget-watchdog: local mount still active: $MOUNTPOINT"
+    warn=1
+  fi
+
+  loop_lines="$(losetup -j "$IMAGE_FILE" 2>/dev/null || true)"
+  if [ -n "$loop_lines" ]; then
+    log WARN "gadget-watchdog: loop active for $IMAGE_FILE"
+    warn=1
+
+    for dev in $(printf '%s\n' "$loop_lines" | cut -d: -f1); do
+      [ -n "$dev" ] || continue
+
+      if findmnt -rn -S "$dev" >/dev/null 2>&1; then
+        log WARN "gadget-watchdog: loop $dev is mounted; not detaching"
+      else
+        if losetup -d "$dev" 2>/dev/null; then
+          log INFO "gadget-watchdog: detached stale loop $dev"
+        else
+          log WARN "gadget-watchdog: failed to detach stale loop $dev"
+        fi
+      fi
+    done
+  fi
+
+  recent_kernel="$(
+    {
+      journalctl -k --since '10 minutes ago' --no-pager -o short-iso 2>/dev/null \
+        || dmesg -T 2>/dev/null | tail -n 200
+    } | grep -Ei 'g_mass_storage|usb_f_mass_storage|dwc2|gadget|mass storage' | tail -n 40 || true
+  )"
+
+  if printf '%s\n' "$recent_kernel" | grep -Eiq 'error|fail|stall|I/O|timeout'; then
+    log WARN "gadget-watchdog: recent gadget-related kernel warnings found; no reload performed"
+    warn=1
+  fi
+
+  if [ "$fail" -ne 0 ]; then
+    log ERROR "gadget-watchdog: CRIT"
+    return 2
+  fi
+
+  if [ "$warn" -ne 0 ]; then
+    log WARN "gadget-watchdog: completed with warnings"
+    return 0
+  fi
+
+  log INFO "gadget-watchdog: OK"
+  return 0
+}
+
+
+write_mtime_fallback_pending() {
+  local source_name="$1" state_file="$2" old_mtime="$3" now_mtime="$4" trace_id
+  local pending_image_mtime pending_source pending_trace_id
+
+  if [ -r "$RUN_DIR/pending" ]; then
+    pending_image_mtime="$(pending_value image_mtime || true)"
+    if [ "$pending_image_mtime" = "$now_mtime" ]; then
+      pending_source="$(pending_value source || true)"
+      pending_trace_id="$(pending_value trace_id || true)"
+      echo "$now_mtime" > "$state_file"
+      log INFO "$source_name: image mtime changed old=$old_mtime new=$now_mtime, pending already exists source=${pending_source:-unknown} trace_id=${pending_trace_id:-none}; mtime state updated"
+      TRACE_ID="${pending_trace_id:-}" trace_event mtime_fallback_pending_exists source="$source_name" trigger_source=mtime-fallback existing_source="${pending_source:-unknown}" old_mtime="$old_mtime" new_mtime="$now_mtime"
+      return 0
+    fi
+  fi
+
+  trace_id="$(trace_new_id)"
+  TRACE_ID="$trace_id" trace_event image_change_detected source="$source_name" trigger_source=mtime-fallback image="$IMAGE_FILE" old_mtime="$old_mtime" new_mtime="$now_mtime"
+  {
+    echo "timestamp=$(date --iso-8601=seconds)"
+    echo "source=$source_name"
+    echo "trigger_source=mtime-fallback"
+    echo "trace_id=$trace_id"
+    echo "old_mtime=$old_mtime"
+    echo "new_mtime=$now_mtime"
+    echo "image_mtime=$now_mtime"
+  } > "$RUN_DIR/pending"
+
+  echo "$now_mtime" > "$state_file"
+  log INFO "$source_name: image mtime changed old=$old_mtime new=$now_mtime pending set trace_id=$trace_id source=mtime-fallback"
+  TRACE_ID="$trace_id" trace_event pending_written source="$source_name" trigger_source=mtime-fallback file="$RUN_DIR/pending" image="$IMAGE_FILE" old_mtime="$old_mtime" new_mtime="$now_mtime"
+  log INFO "$source_name: mtime fallback starts post-trigger"
+  TRACE_ID="$trace_id" trace_event_with_pending mtime_fallback_dispatch source="$source_name"
+  cmd_post_trigger
+}
+
+
+cmd_image_mtime_watch() {
+  require_root
+  ensure_dirs
+
+  local state_file="$STATE_DIR/image-mtime.state"
+  local now_mtime old_mtime
+
+  [ -f "$IMAGE_FILE" ] || {
+    log ERROR "image-mtime-watch: image missing: $IMAGE_FILE"
+    return 2
+  }
+
+  now_mtime="$(stat -c '%Y' "$IMAGE_FILE" 2>/dev/null || echo 0)"
+  [ "$now_mtime" -gt 0 ] || {
+    log ERROR "image-mtime-watch: cannot stat image mtime"
+    return 2
+  }
+
+  old_mtime="$(cat "$state_file" 2>/dev/null || true)"
+  if [ -z "$old_mtime" ]; then
+    echo "$now_mtime" > "$state_file"
+    log INFO "image-mtime-watch: initial mtime recorded: $now_mtime"
+  elif [ "$now_mtime" != "$old_mtime" ]; then
+    write_mtime_fallback_pending image-mtime-watch "$state_file" "$old_mtime" "$now_mtime"
+  else
+    log INFO "image-mtime-watch: image mtime unchanged: $now_mtime"
+  fi
+}
+
+
+cmd_image_watchdog() {
+  require_root
+  ensure_dirs
+
+  local do_send=0 do_reboot_stale=0 max_age="${IMAGE_STALE_SECONDS:-$MAX_DATA_AGE_SECONDS}"
+  local state_file="$STATE_DIR/image-mtime.state"
+  local reboot_state="$STATE_DIR/image-stale-reboot.state"
+  local now now_mtime old_mtime age cooldown last_reboot token chat chat_var msg
+
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --send) do_send=1 ;;
+      --reboot-stale) do_reboot_stale=1 ;;
+      --max-age)
+        shift
+        max_age="${1:-}"
+        ;;
+      *)
+        fail "Unknown option for image-watchdog: $1"
+        ;;
+    esac
+    shift
+  done
+
+  [ -f "$IMAGE_FILE" ] || {
+    log ERROR "image-watchdog: image missing: $IMAGE_FILE"
+    return 2
+  }
+
+  now="$(date +%s)"
+  now_mtime="$(stat -c '%Y' "$IMAGE_FILE" 2>/dev/null || echo 0)"
+  [ "$now_mtime" -gt 0 ] || {
+    log ERROR "image-watchdog: cannot stat image mtime"
+    return 2
+  }
+
+  old_mtime="$(cat "$state_file" 2>/dev/null || true)"
+
+  if [ -z "$old_mtime" ]; then
+    echo "$now_mtime" > "$state_file"
+    log INFO "image-watchdog: initial mtime recorded: $now_mtime"
+  elif [ "$now_mtime" != "$old_mtime" ]; then
+    write_mtime_fallback_pending image-watchdog "$state_file" "$old_mtime" "$now_mtime"
+  else
+    log INFO "image-watchdog: image mtime unchanged: $now_mtime"
+  fi
+
+  age=$((now - now_mtime))
+
+  if [ "$age" -lt "$max_age" ]; then
+    log INFO "image-watchdog: image freshness OK age=${age}s max=${max_age}s"
+    return 0
+  fi
+
+  msg="USB/image stale detected: /usbdisk.img has not changed for ${age}s. The system will restart."
+
+  log WARN "image-watchdog: STALE image=$IMAGE_FILE age=${age}s max=${max_age}s send=$do_send reboot=$do_reboot_stale"
+
+  if [ "$do_send" -eq 1 ]; then
+    IFS='|' read -r token chat chat_var <<< "$(first_telegram_credentials || true)"
+    send_telegram_text "$token" "$chat" "$msg" "$chat_var" || log ERROR "image-watchdog: Telegram send failed"
+  fi
+
+  if [ "$do_reboot_stale" -eq 1 ]; then
+    cooldown="${IMAGE_STALE_REBOOT_COOLDOWN_SECONDS:-14400}"
+    last_reboot="$(cat "$reboot_state" 2>/dev/null || echo 0)"
+
+    if [ "$last_reboot" -gt 0 ] && [ $((now - last_reboot)) -lt "$cooldown" ]; then
+      log WARN "image-watchdog: stale reboot suppressed by cooldown age_since_last=$((now-last_reboot))s cooldown=${cooldown}s"
+      return 2
+    fi
+
+    echo "$now" > "$reboot_state"
+    echo "USB/Image-Stale: /usbdisk.img seit ${age}s unveraendert. Reboot durch image-watchdog." > /etc/restart.reason
+    log WARN "image-watchdog: reboot in 10s wegen stale image age=${age}s"
+    sleep 10
+    systemctl reboot
+  fi
+
+  return 2
+}
+
+
+cmd_gadget_start() {
+  require_root
+  local apply=0
+  [ "${1:-}" = "--apply" ] && apply=1
+  if [ "$apply" -ne 1 ]; then
+    echo "DRY-RUN: modprobe g_mass_storage $GADGET_MODPROBE_ARGS"
+    return 0
+  fi
+  module_loaded g_mass_storage && {
+    log INFO "g_mass_storage already loaded"
+    return 0
+  }
+  # shellcheck disable=SC2086
+  modprobe g_mass_storage $GADGET_MODPROBE_ARGS
+  log INFO "g_mass_storage started"
+}
+
+
+cmd_gadget_stop() {
+  require_root
+  log ERROR "gadget-stop is disabled in this setup: g_mass_storage must not be unloaded in production"
+  echo "gadget-stop disabled: g_mass_storage must stay loaded"
+  return 1
+}
+
+
+
+
+cmd_status_lights() {
+  local cache_text="$RUN_DIR/status-login.txt"
+  local cache_json="$RUN_DIR/status.json"
+  local rc
+
+  case "${1:-}" in
+    --live)
+      shift || true
+      [ "$#" -eq 0 ] || fail "Unknown option for status-lights --live: $*"
+      [ -x /usr/local/sbin/vdisk-relay-status-cache ] || fail "status cache builder missing: /usr/local/sbin/vdisk-relay-status-cache"
+      /usr/local/sbin/vdisk-relay-status-cache --stdout --no-write
+      return $?
+      ;;
+    ""|--cache)
+      [ "${1:-}" = "--cache" ] && shift || true
+      [ "$#" -eq 0 ] || fail "Unknown option for status-lights: $*"
+      ;;
+    *)
+      fail "Unknown option for status-lights: $1"
+      ;;
+  esac
+
+  if [ -r "$cache_text" ] && [ -s "$cache_text" ]; then
+    cat "$cache_text"
+    rc="$(awk -F= '$1 == "exitcode" {print $2; exit}' "$cache_text" 2>/dev/null | tr -dc '0-9-')"
+    [ -n "$rc" ] || rc=1
+    return "$rc"
+  fi
+
+  if [ -r "$cache_json" ] && [ -s "$cache_json" ] && command -v python3 >/dev/null 2>&1; then
+    python3 - "$cache_json" <<'PY'
+import json
+import sys
+
+path = sys.argv[1]
+try:
+    with open(path, "r", encoding="utf-8", errors="replace") as handle:
+        data = json.load(handle)
+except Exception as exc:
+    print("=== vdisk-relay status ===")
+    print(f"FAIL  Status-Cache           cannot read status.json: {exc}")
+    print("exitcode=1")
+    print("updated=")
+    raise SystemExit(1)
+
+overall = data.get("overall", {})
+if isinstance(overall, dict):
+    state = str(overall.get("state") or "FAIL").upper()
+    try:
+        exitcode = int(overall.get("exitcode", 1))
+    except Exception:
+        exitcode = 1
+else:
+    state = str(overall or data.get("overall_state") or "FAIL").upper()
+    exitcode = 0 if state == "OK" else 2
+
+components = data.get("status_components", [])
+if not isinstance(components, list):
+    components = []
+
+prefixes = {
+    "OK": "OK    ",
+    "PENDING": "PEND  ",
+    "WARN": "WARN  ",
+    "WATCH": "WARN  ",
+    "FAIL": "FAIL  ",
+    "CRITICAL": "FAIL  ",
+    "DISABLED": "OFF   ",
+    "OFF": "OFF   ",
+    "UNKNOWN": "UNKN  ",
+}
+
+print("=== vdisk-relay status ===")
+for component in components:
+    if not isinstance(component, dict):
+        continue
+    c_state = str(component.get("state") or "FAIL").upper()
+    prefix = prefixes.get(c_state, "UNKN  ")
+    name = str(component.get("name") or "Unknown")
+    message = str(component.get("message") or "-")
+    print(f"{prefix}{name:<22} {message}")
+if not any(isinstance(component, dict) and component.get("name") == "Overall" for component in components):
+    prefix = prefixes.get(state, "UNKN  ")
+    message = overall.get("message", "-") if isinstance(overall, dict) else "-"
+    print(f"{prefix}{'Overall':<22} {message}")
+print(f"exitcode={exitcode}")
+print("updated=" + str(data.get("generated_at") or ""))
+raise SystemExit(exitcode)
+PY
+    return $?
+  fi
+
+  echo "=== vdisk-relay status ==="
+  echo "FAIL  Status-Cache           status cache missing; run vdisk-relay-status-cache"
+  echo "exitcode=1"
+  echo "updated=$(date -Is)"
+  return 1
+}
+
+cmd_config_backup() {
+  require_root
+  ensure_dirs
+
+  local output="" ts host tmpdir archive_name
+
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --output)
+        shift
+        output="${1:-}"
+        ;;
+      *)
+        fail "Unknown option for config-backup: $1"
+        ;;
+    esac
+    shift
+  done
+
+  ts="$(date +%Y%m%d-%H%M%S)"
+  host="$(hostname 2>/dev/null || echo unknown)"
+  archive_name="vdisk-relay-config-${host}-${ts}.tar.gz"
+
+  if [ -z "$output" ]; then
+    mkdir -p /root/vdisk-relay-config-backups
+    output="/root/vdisk-relay-config-backups/$archive_name"
+  fi
+
+  tmpdir="$(mktemp -d /run/vdisk-relay-config-backup.XXXXXX)"
+  mkdir -p "$tmpdir/etc" "$tmpdir/root" "$tmpdir/META"
+
+  copy_if_exists_for_backup() {
+    local src="$1"
+    local dst="$tmpdir${src}"
+
+    case "$src" in
+      /*) ;;
+      *)
+        echo "$src" >> "$tmpdir/META/skipped-files.txt"
+        return 0
+        ;;
+    esac
+
+    if [ -e "$src" ]; then
+      mkdir -p "$(dirname "$dst")"
+      cp -a "$src" "$dst"
+      echo "$src" >> "$tmpdir/META/included-files.txt"
+    else
+      echo "$src" >> "$tmpdir/META/missing-files.txt"
+    fi
+  }
+
+  copy_tree_if_exists_for_backup() {
+    local src="$1"
+    local dst="$tmpdir${src}"
+
+    case "$src" in
+      /*) ;;
+      *)
+        echo "$src" >> "$tmpdir/META/skipped-files.txt"
+        return 0
+        ;;
+    esac
+
+    if [ -d "$src" ]; then
+      mkdir -p "$dst"
+      cp -a "$src"/. "$dst"/
+      echo "$src/" >> "$tmpdir/META/included-files.txt"
+    else
+      echo "$src/" >> "$tmpdir/META/missing-files.txt"
+    fi
+  }
+
+  write_systemd_enabled_snapshot() {
+    local unit state
+    {
+      for unit in "${CONFIG_BACKUP_SYSTEMD_UNITS[@]}"; do
+        state="$(systemctl is-enabled "$unit" 2>/dev/null || true)"
+        [ -n "$state" ] || state="unknown"
+        printf '%s=%s\n' "$unit" "$state"
+      done
+    } > "$tmpdir/META/systemd-enabled.txt"
+  }
+
+  copy_if_exists_for_backup /etc/vdisk-relay.conf
+  copy_if_exists_for_backup /etc/vdisk-relay.env
+  copy_if_exists_for_backup /etc/vdisk-relay-maintenance-notify.json
+  copy_if_exists_for_backup /root/vdisk-relay-rsync.pass
+  if [ -n "${ARCHIVE_RSYNC_PASSWORD_FILE:-}" ] && [ "${ARCHIVE_RSYNC_PASSWORD_FILE:-}" != "/root/vdisk-relay-rsync.pass" ]; then
+    copy_if_exists_for_backup "$ARCHIVE_RSYNC_PASSWORD_FILE"
+  fi
+  copy_if_exists_for_backup "$CONFIG_BACKUP_GIT_CREDENTIALS"
+  copy_tree_if_exists_for_backup "$CONFIG_BACKUP_SEND_STATE_DIR"
+  copy_tree_if_exists_for_backup "$CONFIG_BACKUP_NM_CONNECTION_DIR"
+  copy_if_exists_for_backup /etc/vdisk-relay.live-enabled
+
+  local gate
+  for gate in /etc/vdisk-relay.allow-*; do
+    [ -e "$gate" ] || continue
+    copy_if_exists_for_backup "$gate"
+  done
+
+  write_systemd_enabled_snapshot
+
+  {
+    echo "created=$(date -Is)"
+    echo "host=$host"
+    echo "vdisk_relay_version=$VERSION"
+    echo "note=config backup; contains secrets if env/password files exist"
+  } > "$tmpdir/META/backup-info.txt"
+
+  (
+    cd "$tmpdir"
+    find . -type f -print | sort > META/manifest.txt
+    tar -czf "$output" .
+  )
+
+  chmod 0600 "$output"
+  rm -rf "$tmpdir"
+
+  log INFO "config-backup erstellt: $output"
+  echo "$output"
+}
+
+ensure_config_default() {
+  local conf="$1"
+  local key="$2"
+  local value="$3"
+
+  grep -Eq "^${key}=" "$conf" && return 1
+  printf '%s="%s"\n' "$key" "$value" >> "$conf"
+  return 0
+}
+
+ensure_config_defaults() {
+  local conf="$1"
+  local changed=0
+
+  [ -f "$conf" ] || return 0
+
+  ensure_config_default "$conf" DATA_ROOT "$DATA_ROOT" && changed=1
+  ensure_config_default "$conf" MAX_DATA_AGE_SECONDS "$MAX_DATA_AGE_SECONDS" && changed=1
+  ensure_config_default "$conf" IMAGE_STALE_SECONDS "$IMAGE_STALE_SECONDS" && changed=1
+  ensure_config_default "$conf" SOURCE_DEFAULT_RETRIES "4" && changed=1
+  ensure_config_default "$conf" SOURCE_DEFAULT_WAIT_SECONDS "3" && changed=1
+  ensure_config_default "$conf" SOURCE_LAST_STATE_DIR "$STATE_DIR/last" && changed=1
+  ensure_config_default "$conf" SOURCE_TMP_LOG_DIR "$RUN_DIR" && changed=1
+  ensure_config_default "$conf" SOURCE_DEFAULT_EXTENSION "mp4" && changed=1
+  ensure_config_default "$conf" PREVIEW_NEW_PER_RUN "3" && changed=1
+  ensure_config_default "$conf" PREVIEW_FFMPEG_TIMEOUT "180" && changed=1
+  ensure_config_default "$conf" PREVIEW_LONG_FFMPEG_TIMEOUT "600" && changed=1
+  ensure_config_default "$conf" PREVIEW_SCAN_MAX_FILES "5000" && changed=1
+  ensure_config_default "$conf" PREVIEW_CACHE_MAX_FILES "5000" && changed=1
+  ensure_config_default "$conf" PREVIEW_OFFSET_SECONDS "1" && changed=1
+  ensure_config_default "$conf" PREVIEW_SMALL_VIDEO_BYTES "153600" && changed=1
+  ensure_config_default "$conf" PREVIEW_ATTEMPTS_PER_RUN "4" && changed=1
+  ensure_config_default "$conf" WEB_SCREENSAVER_IDLE_MINUTES "0" && changed=1
+  ensure_config_default "$conf" WEB_SCREENSAVER_MODE "floating" && changed=1
+
+  ensure_config_default "$conf" NETWORK_GUARDIAN_ENABLED "1" && changed=1
+  ensure_config_default "$conf" NETWORK_GUARDIAN_CHECK_INTERVAL_SECONDS "300" && changed=1
+  ensure_config_default "$conf" NETWORK_GUARDIAN_FAILS_BEFORE_AP "3" && changed=1
+  ensure_config_default "$conf" NETWORK_GUARDIAN_RECONNECT_WAIT_SECONDS "90" && changed=1
+  ensure_config_default "$conf" NETWORK_GUARDIAN_AP_MIN_SECONDS "600" && changed=1
+  ensure_config_default "$conf" NETWORK_GUARDIAN_UI_HEARTBEAT_SECONDS "30" && changed=1
+  ensure_config_default "$conf" NETWORK_GUARDIAN_UI_ACTIVE_GRACE_SECONDS "120" && changed=1
+  ensure_config_default "$conf" NETWORK_GUARDIAN_RECOVERY_WAIT_SECONDS "90" && changed=1
+  ensure_config_default "$conf" NETWORK_GUARDIAN_AUTO_REBOOT_ENABLED "0" && changed=1
+  ensure_config_default "$conf" NETWORK_GUARDIAN_AUTO_REBOOT_AFTER_AP_CYCLES "6" && changed=1
+  ensure_config_default "$conf" NETWORK_GUARDIAN_AP_SSID_PREFIX "VDiskRelay-Setup" && changed=1
+  ensure_config_default "$conf" NETWORK_GUARDIAN_AP_PASSWORD "" && changed=1
+  ensure_config_default "$conf" NETWORK_GUARDIAN_AP_IPV4 "10.254.77.1/24" && changed=1
+  ensure_config_default "$conf" LIVE_FAST_LANE_ENABLED "$LIVE_FAST_LANE_ENABLED" && changed=1
+  ensure_config_default "$conf" LIVE_FAST_LANE_DELAY_SECONDS "$LIVE_FAST_LANE_DELAY_SECONDS" && changed=1
+  ensure_config_default "$conf" LIVE_FAST_QUIET_SECONDS "$LIVE_FAST_QUIET_SECONDS" && changed=1
+  ensure_config_default "$conf" SYNC_RSYNC_OPTIONS "$SYNC_RSYNC_OPTIONS" && changed=1
+  ensure_config_default "$conf" SYNC_RSYNC_DRYRUN_OPTIONS "$SYNC_RSYNC_DRYRUN_OPTIONS" && changed=1
+  ensure_config_default "$conf" TIMELINE_TRACE_ENABLED "$TIMELINE_TRACE_ENABLED" && changed=1
+  ensure_config_default "$conf" TIMELINE_TRACE_FILE "$TIMELINE_TRACE_FILE" && changed=1
+  ensure_config_default "$conf" TIMELINE_TRACE_SYSTEM_SNAPSHOT "$TIMELINE_TRACE_SYSTEM_SNAPSHOT" && changed=1
+  ensure_config_default "$conf" TELEGRAM_TRACE_REPLY_BODY "$TELEGRAM_TRACE_REPLY_BODY" && changed=1
+  ensure_config_default "$conf" TELEGRAM_TRACE_REPLY_MAX_BYTES "$TELEGRAM_TRACE_REPLY_MAX_BYTES" && changed=1
+  ensure_config_default "$conf" DELETE_PREVIEW_WITH_VIDEO "$DELETE_PREVIEW_WITH_VIDEO" && changed=1
+  ensure_config_default "$conf" ULTRA_FAST_LANE_ENABLED "$ULTRA_FAST_LANE_ENABLED" && changed=1
+  ensure_config_default "$conf" ULTRA_FAST_LANE_DELAY_SECONDS "$ULTRA_FAST_LANE_DELAY_SECONDS" && changed=1
+  ensure_config_default "$conf" ULTRA_FAST_LANE_QUIET_SECONDS "$ULTRA_FAST_LANE_QUIET_SECONDS" && changed=1
+  ensure_config_default "$conf" ULTRA_FAST_LANE_SYNC_AFTER_SEND "$ULTRA_FAST_LANE_SYNC_AFTER_SEND" && changed=1
+  ensure_config_default "$conf" ULTRA_FAST_DUPLICATE_MODE "$ULTRA_FAST_DUPLICATE_MODE" && changed=1
+  ensure_config_default "$conf" ULTRA_FAST_REMAINDER_QUEUE_ENABLED "$ULTRA_FAST_REMAINDER_QUEUE_ENABLED" && changed=1
+  ensure_config_default "$conf" ULTRA_FAST_REMAINDER_QUEUE_DELAY_SECONDS "$ULTRA_FAST_REMAINDER_QUEUE_DELAY_SECONDS" && changed=1
+  ensure_config_default "$conf" TELEGRAM_QUEUE_ENABLED "$TELEGRAM_QUEUE_ENABLED" && changed=1
+  ensure_config_default "$conf" TELEGRAM_QUEUE_RETRY_SECONDS "$TELEGRAM_QUEUE_RETRY_SECONDS" && changed=1
+  ensure_config_default "$conf" TELEGRAM_QUEUE_MAX_ATTEMPTS "$TELEGRAM_QUEUE_MAX_ATTEMPTS" && changed=1
+  ensure_config_default "$conf" TELEGRAM_QUEUE_PROCESS_LIMIT "$TELEGRAM_QUEUE_PROCESS_LIMIT" && changed=1
+  ensure_config_default "$conf" TELEGRAM_QUEUE_DONE_MAX_FILES "$TELEGRAM_QUEUE_DONE_MAX_FILES" && changed=1
+
+  if [ "$changed" -eq 1 ]; then
+    chmod 0644 "$conf"
+  log INFO "Config defaults added: Data/Source/Preview/WebUI/Network Guardian/Fast-Lane/Telegram-Queue in $conf"
+  fi
+}
+
+cmd_ensure_config_defaults() {
+  require_root
+  ensure_config_defaults "$CONFIG_FILE"
+  echo "OK ensure-config-defaults"
+}
+
+cmd_config_restore() {
+  require_root
+  ensure_dirs
+
+  local archive="" apply=0 tmpdir prebackup backup_rsync_password_file
+
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --apply)
+        apply=1
+        ;;
+      *)
+        if [ -z "$archive" ]; then
+          archive="$1"
+        else
+          fail "Unknown argument for config-restore: $1"
+        fi
+        ;;
+    esac
+    shift
+  done
+
+  [ -n "$archive" ] || fail "Missing backup archive"
+  [ -r "$archive" ] || fail "Archive not readable: $archive"
+
+  tmpdir="$(mktemp -d /run/vdisk-relay-config-restore.XXXXXX)"
+  tar -xzf "$archive" -C "$tmpdir"
+
+  echo "=== Content ==="
+  find "$tmpdir" -type f | sed "s#^$tmpdir/##" | sort
+
+  [ -f "$tmpdir/etc/vdisk-relay.conf" ] || fail "Archive does not contain etc/vdisk-relay.conf"
+
+  if [ "$apply" -ne 1 ]; then
+    echo
+    echo "DRY-RUN: nothing restored."
+    echo "With --apply, a pre-restore backup is created automatically first."
+    rm -rf "$tmpdir"
+    return 0
+  fi
+
+  echo "=== Pre-Restore-Backup ==="
+  prebackup="$(cmd_config_backup)"
+  echo "$prebackup"
+
+  archive_knows_path() {
+    local path="$1"
+    grep -Fxq "$path" "$tmpdir/META/included-files.txt" 2>/dev/null \
+      || grep -Fxq "$path" "$tmpdir/META/missing-files.txt" 2>/dev/null
+  }
+
+  backup_config_value() {
+    local key="$1"
+    local default="$2"
+    local conf="$tmpdir/etc/vdisk-relay.conf"
+
+    [ -r "$conf" ] || {
+      printf '%s\n' "$default"
+      return 0
+    }
+
+    case "$key" in
+      ARCHIVE_RSYNC_PASSWORD_FILE)
+        (
+          ARCHIVE_RSYNC_PASSWORD_FILE="$default"
+          # shellcheck source=/dev/null
+          . "$conf" >/dev/null 2>&1 || true
+          printf '%s\n' "${ARCHIVE_RSYNC_PASSWORD_FILE:-$default}"
+        )
+        ;;
+      *)
+        printf '%s\n' "$default"
+        ;;
+    esac
+  }
+
+  safe_restore_rel() {
+    local rel="$1"
+    case "$rel" in
+      ""|/*|*"/../"*|"../"*|*".." )
+        fail "Unsafe restore path in backup: $rel"
+        ;;
+    esac
+  }
+
+  restore_file() {
+    local rel="$1"
+    local dst="/$rel"
+    local mode="$2"
+
+    safe_restore_rel "$rel"
+    [ -e "$tmpdir/$rel" ] || return 0
+
+    mkdir -p "$(dirname "$dst")"
+    cp -a "$tmpdir/$rel" "$dst"
+    chmod "$mode" "$dst"
+    chown root:root "$dst"
+    echo "restored: $dst"
+  }
+
+  restore_tree_files() {
+    local rel="$1"
+    local mode="$2"
+    local src_root="$tmpdir/$rel"
+    local src item_rel dst
+
+    safe_restore_rel "$rel"
+    [ -d "$src_root" ] || return 0
+
+    mkdir -p "/$rel"
+    chmod 0700 "/$rel"
+    chown root:root "/$rel"
+    find "$src_root" -type f -print | while IFS= read -r src; do
+      item_rel="${src#$tmpdir/}"
+      safe_restore_rel "$item_rel"
+      dst="/$item_rel"
+      mkdir -p "$(dirname "$dst")"
+      cp -a "$src" "$dst"
+      chmod "$mode" "$dst"
+      chown root:root "$dst"
+      echo "restored: $dst"
+    done
+  }
+
+  unit_allowed_for_restore() {
+    local wanted="$1"
+    local unit
+    for unit in "${CONFIG_BACKUP_SYSTEMD_UNITS[@]}"; do
+      [ "$unit" = "$wanted" ] && return 0
+    done
+    return 1
+  }
+
+  restore_systemd_enabled_snapshot() {
+    local snapshot="$tmpdir/META/systemd-enabled.txt"
+    local line unit state
+
+    [ -r "$snapshot" ] || return 0
+    while IFS= read -r line; do
+      [ -n "$line" ] || continue
+      unit="${line%%=*}"
+      state="${line#*=}"
+      unit_allowed_for_restore "$unit" || continue
+
+      case "$state" in
+        enabled|enabled-runtime|linked|linked-runtime|indirect)
+          systemctl enable "$unit" >/dev/null 2>&1 || true
+          echo "systemd enabled: $unit"
+          ;;
+        disabled)
+          systemctl disable "$unit" >/dev/null 2>&1 || true
+          echo "systemd disabled: $unit"
+          ;;
+        *)
+          :
+          ;;
+      esac
+    done < "$snapshot"
+  }
+
+  git_credentials_configured() {
+    [ -r "$CONFIG_BACKUP_GIT_CREDENTIALS" ] || return 1
+    python3 - "$CONFIG_BACKUP_GIT_CREDENTIALS" <<'PY'
+import json
+import sys
+
+try:
+    with open(sys.argv[1], "r", encoding="utf-8") as handle:
+        data = json.load(handle)
+except Exception:
+    raise SystemExit(1)
+
+raise SystemExit(0 if data.get("username") and data.get("token") else 1)
+PY
+  }
+
+  enforce_update_timer_credentials() {
+    if git_credentials_configured; then
+      return 0
+    fi
+
+    systemctl disable --now vdisk-relay-update-check.timer >/dev/null 2>&1 || true
+    systemctl stop vdisk-relay-update.service vdisk-relay-update-check.service >/dev/null 2>&1 || true
+    echo "systemd disabled: vdisk-relay-update-check.timer (Git credentials missing)"
+  }
+
+  reload_networkmanager_connections() {
+    [ -d "$tmpdir${CONFIG_BACKUP_NM_CONNECTION_DIR}" ] || return 0
+    if command -v nmcli >/dev/null 2>&1; then
+      nmcli connection reload >/dev/null 2>&1 || true
+      echo "NetworkManager connections reloaded"
+    fi
+  }
+
+  restore_file etc/vdisk-relay.conf 0644
+  ensure_config_defaults "$CONFIG_FILE"
+  restore_file etc/vdisk-relay.env 0600
+  restore_file etc/vdisk-relay-maintenance-notify.json 0644
+
+  backup_rsync_password_file="$(backup_config_value ARCHIVE_RSYNC_PASSWORD_FILE /root/vdisk-relay-rsync.pass)"
+  restore_file root/vdisk-relay-rsync.pass 0600
+  if [ -n "$backup_rsync_password_file" ] && [ "$backup_rsync_password_file" != "/root/vdisk-relay-rsync.pass" ]; then
+    case "$backup_rsync_password_file" in
+      /*) restore_file "${backup_rsync_password_file#/}" 0600 ;;
+      *) echo "skipped unsafe rsync password path: $backup_rsync_password_file" ;;
+    esac
+  fi
+
+  if archive_knows_path "$CONFIG_BACKUP_GIT_CREDENTIALS"; then
+    rm -f "$CONFIG_BACKUP_GIT_CREDENTIALS"
+  fi
+  restore_file "${CONFIG_BACKUP_GIT_CREDENTIALS#/}" 0600
+  restore_tree_files "${CONFIG_BACKUP_SEND_STATE_DIR#/}" 0600
+  restore_tree_files "${CONFIG_BACKUP_NM_CONNECTION_DIR#/}" 0600
+
+  rm -f /etc/vdisk-relay.live-enabled /etc/vdisk-relay.allow-*
+
+  restore_file etc/vdisk-relay.live-enabled 0644
+
+  local f rel
+  for f in "$tmpdir"/etc/vdisk-relay.allow-*; do
+    [ -e "$f" ] || continue
+    rel="${f#$tmpdir/}"
+    restore_file "$rel" 0644
+  done
+
+  systemctl daemon-reload 2>/dev/null || true
+  restore_systemd_enabled_snapshot
+  enforce_update_timer_credentials
+  reload_networkmanager_connections
+
+  rm -rf "$tmpdir"
+
+  log INFO "config-restore applied from: $archive"
+  echo "Restore completed."
+  echo "Pre-Restore-Backup: $prebackup"
+}
+
+main() {
+  local cmd="${1:-help}"
+  [ "$#" -gt 0 ] && shift || true
+  case "$cmd" in
+    help|-h|--help) usage ;;
+    status) cmd_status "$@" ;;
+    status-lights) cmd_status_lights "$@" ;;
+    config-ready) cmd_config_ready "$@" ;;
+    config) cmd_config "$@" ;;
+    ensure-config-defaults|ensure_config_defaults) cmd_ensure_config_defaults "$@" ;;
+    config-backup) cmd_config_backup "$@" ;;
+    config-restore) cmd_config_restore "$@" ;;
+    sources) cmd_inspect_data "$@" ;;
+    inspect-data) cmd_inspect_data "$@" ;;
+    notify-data) cmd_notify_data "$@" ;;
+    telegram-queue-worker) cmd_telegram_queue_worker "$@" ;;
+    test-file-send) cmd_test_file_send "$@" ;;
+    test-text-send) cmd_test_text_send "$@" ;;
+    trigger) cmd_trigger "$@" ;;
+    post-trigger) cmd_post_trigger "$@" ;;
+    retry) cmd_retry "$@" ;;
+    sync) cmd_sync "$@" ;;
+    image-check) cmd_image_check "$@" ;;
+    live-sync) cmd_live_sync "$@" ;;
+    fast-sync) cmd_fast_sync "$@" ;;
+    ultra-fast-sync) cmd_ultra_fast_sync "$@" ;;
+    preview-suspend) cmd_preview_suspend "$@" ;;
+    watch) cmd_watch "$@" ;;
+    archive) cmd_archive "$@" ;;
+    health) cmd_health "$@" ;;
+    boot-notify) cmd_boot_notify "$@" ;;
+    gadget-status) cmd_gadget_status "$@" ;;
+    gadget-watchdog) cmd_gadget_watchdog "$@" ;;
+    image-mtime-watch) cmd_image_mtime_watch "$@" ;;
+    image-watchdog) cmd_image_watchdog "$@" ;;
+    gadget-start) cmd_gadget_start "$@" ;;
+    gadget-stop) cmd_gadget_stop "$@" ;;
+    *) usage; fail "Unbekanntes Kommando: $cmd" ;;
+  esac
+}
+
+main "$@"

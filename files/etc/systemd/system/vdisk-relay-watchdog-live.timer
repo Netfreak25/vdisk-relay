@@ -1,0 +1,13 @@
+[Unit]
+Description=vdisk-relay live watchdog timer
+ConditionPathExists=/etc/vdisk-relay.live-enabled
+ConditionPathExists=/etc/vdisk-relay.allow-sync
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=15min
+AccuracySec=1min
+Unit=vdisk-relay-watchdog-live.service
+
+[Install]
+WantedBy=timers.target

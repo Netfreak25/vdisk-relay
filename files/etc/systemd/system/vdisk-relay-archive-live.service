@@ -1,0 +1,16 @@
+[Unit]
+Description=vdisk-relay archive /files via rsync daemon
+After=network-online.target
+Wants=network-online.target
+ConditionPathExists=/usr/local/sbin/vdisk-relay
+ConditionPathExists=/etc/vdisk-relay.live-enabled
+ConditionPathExists=/etc/vdisk-relay.allow-archive
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/vdisk-relay archive --apply
+TimeoutStartSec=20min
+KillMode=control-group
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7

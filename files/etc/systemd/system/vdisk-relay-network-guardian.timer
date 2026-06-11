@@ -1,0 +1,12 @@
+[Unit]
+Description=vdisk-relay Network Guardian timer
+ConditionPathExists=/etc/vdisk-relay.allow-network-guardian
+
+[Timer]
+OnBootSec=2min
+OnUnitInactiveSec=5min
+AccuracySec=30s
+Unit=vdisk-relay-network-guardian.service
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,11 @@
+[Unit]
+Description=vdisk-relay preview cache timer
+
+[Timer]
+OnBootSec=5min
+OnUnitInactiveSec=10min
+AccuracySec=1min
+Unit=vdisk-relay-preview-cache.service
+
+[Install]
+WantedBy=timers.target
