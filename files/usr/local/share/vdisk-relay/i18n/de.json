@@ -28,6 +28,7 @@
   "js.response_unreadable": "Antwort konnte nicht gelesen werden.",
   "js.server_response_unreadable": "Serverantwort konnte nicht gelesen werden.",
   "js.update_action_starting": "Aktion wird gestartet. Warte auf Service-Status.",
+  "js.branch_switch_started": "Branch-Wechsel wurde gestartet. Warte auf Statusdaten.",
   "js.update_check_running": "Update-Check läuft.",
   "js.update_check_started": "Update-Check wurde gestartet.",
   "js.update_finished": "Update-Lauf beendet",

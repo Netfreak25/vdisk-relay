@@ -18,6 +18,8 @@ LOCK_FILE = f"{UPDATE_DIR}/update.lock"
 UPDATE_CHECK = "/usr/local/sbin/vdisk-relay-update-check"
 GIT_CREDENTIALS_FILE = f"{STATE_DIR}/git-credentials.json"
 GIT_ASKPASS = "/usr/local/sbin/vdisk-relay-git-askpass"
+BRANCH_SWITCH_FILE = f"{UPDATE_DIR}/branch-switch.json"
+ALLOWED_BRANCHES = ("main", "dev")
 
 
 def now_iso():
@@ -56,6 +58,30 @@ def git_credentials_status():
     }
 
 
+def consume_branch_switch_request():
+    try:
+        with open(BRANCH_SWITCH_FILE, "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+    except FileNotFoundError:
+        return ""
+    except Exception:
+        try:
+            os.unlink(BRANCH_SWITCH_FILE)
+        except FileNotFoundError:
+            pass
+        raise RuntimeError("Branch switch request is invalid")
+
+    try:
+        os.unlink(BRANCH_SWITCH_FILE)
+    except FileNotFoundError:
+        pass
+
+    branch = str(data.get("branch", "")).strip()
+    if branch not in ALLOWED_BRANCHES:
+        raise RuntimeError("Unsupported branch switch target: " + (branch or "-"))
+    return branch
+
+
 class UpdateJob:
     def __init__(self):
         os.makedirs(UPDATE_DIR, mode=0o755, exist_ok=True)
@@ -63,6 +89,8 @@ class UpdateJob:
         self.started_at = now_iso()
         self.old_commit = ""
         self.new_commit = ""
+        self.branch = ""
+        self.target_branch = ""
         self.exit_code = None
         self.diagnostics = ""
         self.service_checks = {}
@@ -78,6 +106,8 @@ class UpdateJob:
             "finished_at": finished_at,
             "old_commit": self.old_commit,
             "new_commit": self.new_commit,
+            "branch": self.branch,
+            "target_branch": self.target_branch,
             "exit_code": exit_code if exit_code is not None else self.exit_code,
             "running": running,
             "diagnostics": trim(self.diagnostics),
@@ -179,6 +209,51 @@ class UpdateJob:
             self.log("git value exception: " + str(exc))
         return ""
 
+    def git_ref_exists(self, repo, ref):
+        return bool(self.git_value(repo, ["rev-parse", "--verify", "--quiet", ref]))
+
+    def switch_branch_if_requested(self, repo):
+        if not self.target_branch:
+            return
+
+        remote_ref = "refs/remotes/origin/" + self.target_branch
+        if not self.git_ref_exists(repo, remote_ref):
+            raise RuntimeError("Remote branch origin/" + self.target_branch + " not found")
+
+        local_ref = "refs/heads/" + self.target_branch
+        if self.git_ref_exists(repo, local_ref):
+            rc = self.run_command(
+                "switching",
+                "Switching to branch " + self.target_branch,
+                self.git_command(repo, ["checkout", self.target_branch]),
+                timeout=90,
+                env=self.git_env(),
+            )
+        else:
+            rc = self.run_command(
+                "switching",
+                "Creating branch " + self.target_branch + " from origin/" + self.target_branch,
+                self.git_command(repo, ["checkout", "-B", self.target_branch, "origin/" + self.target_branch]),
+                timeout=90,
+                env=self.git_env(),
+            )
+        if rc != 0:
+            self.exit_code = rc
+            raise RuntimeError("Git branch switch failed")
+
+        rc = self.run_command(
+            "switching",
+            "Setting upstream for branch " + self.target_branch,
+            self.git_command(repo, ["branch", "--set-upstream-to", "origin/" + self.target_branch, self.target_branch]),
+            timeout=30,
+            env=self.git_env(),
+        )
+        if rc != 0:
+            self.exit_code = rc
+            raise RuntimeError("Git upstream setup failed")
+
+        self.branch = self.git_value(repo, ["rev-parse", "--abbrev-ref", "HEAD"])
+
     def service_state(self, unit):
         systemctl = shutil.which("systemctl") or "/bin/systemctl"
         try:
@@ -197,8 +272,12 @@ class UpdateJob:
     def run(self):
         open(LOG_FILE, "w", encoding="utf-8").close()
         os.chmod(LOG_FILE, 0o644)
-        self.write_status("running", "starting", "Preparing update", running=True)
+        self.target_branch = consume_branch_switch_request()
+        start_message = "Preparing branch switch to " + self.target_branch if self.target_branch else "Preparing update"
+        self.write_status("running", "starting", start_message, running=True)
         self.log("Update job started: " + self.job_id)
+        if self.target_branch:
+            self.log("branch switch requested: " + self.target_branch)
 
         repo_raw = read_file(REPO_ROOT_FILE).strip()
         if not repo_raw:
@@ -212,10 +291,13 @@ class UpdateJob:
             raise RuntimeError(f"Install script missing: {install_script}")
 
         self.old_commit = self.git_value(repo, ["rev-parse", "HEAD"])
+        self.branch = self.git_value(repo, ["rev-parse", "--abbrev-ref", "HEAD"])
         rc = self.run_command("fetching", "Git fetch running", self.git_command(repo, ["fetch", "--quiet", "--prune"]), timeout=120, env=self.git_env())
         if rc != 0:
             self.exit_code = rc
             raise RuntimeError("Git fetch failed")
+
+        self.switch_branch_if_requested(repo)
 
         rc = self.run_command("pulling", "Git pull running", self.git_command(repo, ["pull", "--ff-only"]), timeout=180, env=self.git_env())
         if rc != 0:
@@ -223,6 +305,9 @@ class UpdateJob:
             raise RuntimeError("Git pull failed")
 
         self.new_commit = self.git_value(repo, ["rev-parse", "HEAD"])
+        self.branch = self.git_value(repo, ["rev-parse", "--abbrev-ref", "HEAD"])
+        if not os.path.isfile(install_script):
+            raise RuntimeError(f"Install script missing after update: {install_script}")
         rc = self.run_command("installing", "Installation running", ["/bin/bash", install_script, "--no-pull"], timeout=900)
         if rc != 0:
             self.exit_code = rc

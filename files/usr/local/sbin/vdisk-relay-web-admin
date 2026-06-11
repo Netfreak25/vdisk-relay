@@ -71,6 +71,8 @@ UPDATE_CHECK_STATUS = "/var/lib/vdisk-relay/update-check.json"
 UPDATE_STATUS = "/var/lib/vdisk-relay/update/update-status.json"
 UPDATE_LOG = "/var/lib/vdisk-relay/update/update.log"
 UPDATE_CHECK_LOG = "/var/lib/vdisk-relay/update/update-check.log"
+UPDATE_BRANCH_SWITCH_REQUEST = "/var/lib/vdisk-relay/update/branch-switch.json"
+UPDATE_BRANCH_CHOICES = ("main", "dev")
 APP_LOG = "/var/log/vdisk-relay.log"
 TELEGRAM_LOG_PATTERNS = ["telegram", "send-ok", "send-failed", "test-file-send", "boot-notify"]
 TELEGRAM_DEBUG_LOG_LINES = 35
@@ -623,6 +625,7 @@ def js_i18n_json():
         "js.never_run",
         "js.update_started_waiting",
         "js.update_check_started",
+        "js.branch_switch_started",
         "js.empty_service_type_response",
     ]
     data = language_catalog()
@@ -2578,6 +2581,27 @@ def current_git_commit_short():
         commit = head
     if re.match(r"^[0-9a-fA-F]{7,40}$", commit or ""):
         return commit[:12]
+    return "-"
+
+
+def current_git_branch():
+    repo_root = first_existing_repo_root()
+    if not repo_root:
+        return "-"
+    git_dir = resolve_git_dir(repo_root)
+    if not git_dir:
+        return "-"
+    head = read_file(os.path.join(git_dir, "HEAD"), "").strip()
+    if not head:
+        return "-"
+    if head.startswith("ref:"):
+        ref = head.split(":", 1)[1].strip()
+        prefix = "refs/heads/"
+        if ref.startswith(prefix):
+            return ref[len(prefix):] or "-"
+        return ref or "-"
+    if re.match(r"^[0-9a-fA-F]{7,40}$", head):
+        return "detached"
     return "-"
 
 
@@ -11901,6 +11925,34 @@ def start_fixed_unit(unit):
     return systemctl_quick(["start", "--no-block", unit], 8)
 
 
+def validate_update_branch(branch):
+    branch = str(branch or "").strip()
+    if branch not in UPDATE_BRANCH_CHOICES:
+        raise ValueError("Unsupported update branch: " + (branch or "-"))
+    return branch
+
+
+def write_update_branch_switch_request(branch):
+    branch = validate_update_branch(branch)
+    json_write_atomic(
+        UPDATE_BRANCH_SWITCH_REQUEST,
+        {
+            "branch": branch,
+            "requested_at": datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds"),
+            "source": "webui",
+        },
+        0o644,
+    )
+    return branch
+
+
+def clear_update_branch_switch_request():
+    try:
+        os.unlink(UPDATE_BRANCH_SWITCH_REQUEST)
+    except FileNotFoundError:
+        pass
+
+
 def update_badge(status, running=False):
     if running:
         return '<span class="badge warn">RUNNING</span>'
@@ -12060,11 +12112,23 @@ def render_update_page(query=None):
     status_data = load_status_json()
     check_journal_rc, check_journal = read_unit_journal("vdisk-relay-update-check.service", 80)
     updater_unit_rows = render_unit_control_rows(UPDATER_UNITS, status_data=status_data)
+    actual_branch = current_git_branch()
+    check_branch = str(check.get("branch", "") if isinstance(check, dict) else "").strip()
+    job_branch = str(job.get("branch", "") if isinstance(job, dict) else "").strip()
+    current_branch = actual_branch if actual_branch != "-" else job_branch or check_branch
+    display_branch = current_branch or "-"
     can_start = (
         capability["repo_known"]
         and capability["repo_exists"]
         and capability["runner_exists"]
         and not update_active
+    )
+    can_switch_branch = (
+        capability["repo_known"]
+        and capability["repo_exists"]
+        and capability["runner_exists"]
+        and not update_active
+        and not check_active
     )
 
     update_button = (
@@ -12073,6 +12137,19 @@ def render_update_page(query=None):
         else '<button class="danger" type="submit" disabled>Start update</button>'
     )
     check_button = '<button type="submit">Check update</button>'
+
+    branch_buttons = []
+    for branch_name in UPDATE_BRANCH_CHOICES:
+        branch_label = "Active: " + branch_name if branch_name == current_branch else "Switch to " + branch_name
+        disabled = " disabled" if branch_name == current_branch or not can_switch_branch else ""
+        branch_buttons.append(
+            '<form method="post" action="/update/branch" class="inline" data-ayesx-reload="0" onsubmit="return confirm(\'Switch update branch to '
+            + esc(branch_name)
+            + '? The updater will pull and install that branch.\');">'
+            + '<input type="hidden" name="branch" value="' + esc(branch_name) + '">'
+            + '<button type="submit" class="secondary"' + disabled + '>' + esc(branch_label) + '</button>'
+            + '</form>'
+        )
 
     monitor_active = "1" if update_active or check_active else "0"
     refresh_script = ""
@@ -12326,7 +12403,7 @@ def render_update_page(query=None):
     setText('update-live-message', message);
     setHtml('update-check-badge', badgeHtml(check.status || 'unknown', checkRunning));
     setHtml('update-job-summary', jobLine);
-    setText('update-branch', check.branch || '-');
+    setText('update-branch', job.branch || check.branch || '-');
     setText('update-local', check.current_short || '-');
     setText('update-remote', check.remote_short || '-');
     setText('update-behind', check.behind == null ? '-' : check.behind);
@@ -12385,18 +12462,23 @@ def render_update_page(query=None):
 
   document.addEventListener('videoVdisk:ayesxAction', function(event){
     var path = event.detail && event.detail.path;
-    if (path !== '/update/check' && path !== '/update/start') {
+    if (path !== '/update/check' && path !== '/update/start' && path !== '/update/branch') {
       return;
     }
     reloadAfterFinish = true;
     actionGraceUntil = Date.now() + 10000;
-    setLiveState(path === '/update/start' ? text('js.update_started_waiting', 'Update was started. Waiting for status data.') : text('js.update_check_started', 'Update check was started.'), false);
+    setLiveState(
+      path === '/update/start'
+        ? text('js.update_started_waiting', 'Update was started. Waiting for status data.')
+        : (path === '/update/branch' ? text('js.branch_switch_started', 'Branch switch was started. Waiting for status data.') : text('js.update_check_started', 'Update check was started.')),
+      false
+    );
     schedulePoll(800);
   });
 
   document.addEventListener('videoVdisk:updateConnectionLost', function(event){
     var path = event.detail && event.detail.path;
-    if (path === '/update/check' || path === '/update/start') {
+    if (path === '/update/check' || path === '/update/start' || path === '/update/branch') {
       markDisconnected();
     }
   });
@@ -12438,7 +12520,7 @@ def render_update_page(query=None):
         + '<div id="update-check-badge">' + update_badge(check_status, check_active) + '</div>'
         + '</section>'
         + '<div class="update-status-grid">'
-        + '<div class="stat-card"><span>Branch</span><b id="update-branch">' + esc(check.get("branch", "-") if isinstance(check, dict) else "-") + '</b></div>'
+        + '<div class="stat-card"><span>Branch</span><b id="update-branch">' + esc(display_branch) + '</b></div>'
         + '<div class="stat-card"><span>Local</span><b id="update-local">' + esc(check.get("current_short", "-") if isinstance(check, dict) else "-") + '</b></div>'
         + '<div class="stat-card"><span>Remote</span><b id="update-remote">' + esc(check.get("remote_short", "-") if isinstance(check, dict) else "-") + '</b></div>'
         + '<div class="stat-card"><span>Behind</span><b id="update-behind">' + esc(check.get("behind", "-") if isinstance(check, dict) else "-") + '</b></div>'
@@ -12452,6 +12534,9 @@ def render_update_page(query=None):
         + update_button
         + '</form>'
         + '<a class="button secondary" href="/update">Refresh</a>'
+        + '<div class="actions">'
+        + ''.join(branch_buttons)
+        + '</div>'
         + '</section>'
         + '<section class="panel">'
         + '<h2>Latest update run</h2>'
@@ -12532,6 +12617,29 @@ def handle_update_post(handler, path, form):
             return True
         rc, out = start_fixed_unit("vdisk-relay-update.service")
         msg = "Update started" if rc == 0 else "Update could not be started: " + out[:180]
+        handler.redirect("/update?msg=" + quote(msg))
+        return True
+
+    if path == "/update/branch":
+        if systemctl_active("vdisk-relay-update.service") == "active":
+            handler.redirect("/update?msg=" + quote("Update already running"))
+            return True
+        if systemctl_active("vdisk-relay-update-check.service") == "active":
+            handler.redirect("/update?msg=" + quote("Update check already running"))
+            return True
+        capability = update_capability()
+        if not (capability["repo_known"] and capability["repo_exists"] and capability["runner_exists"]):
+            handler.redirect("/update?msg=" + quote("Update capability missing"))
+            return True
+        try:
+            branch = write_update_branch_switch_request(form.get("branch", [""])[0])
+        except ValueError as exc:
+            handler.redirect("/update?msg=" + quote(str(exc)))
+            return True
+        rc, out = start_fixed_unit("vdisk-relay-update.service")
+        if rc != 0:
+            clear_update_branch_switch_request()
+        msg = "Branch switch to " + branch + " started" if rc == 0 else "Branch switch could not be started: " + out[:180]
         handler.redirect("/update?msg=" + quote(msg))
         return True
 

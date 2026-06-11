@@ -318,6 +318,10 @@ WebUI:
 http://<host>/
 ```
 
+The System / Update page can switch the repository between the `main` and `dev`
+branches. A branch switch runs through the same controlled update service as a
+normal update: fetch, checkout, fast-forward pull, install, and service refresh.
+
 Generated WebUI/status cache files:
 
 ```text

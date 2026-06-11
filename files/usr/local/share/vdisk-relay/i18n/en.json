@@ -28,6 +28,7 @@
   "js.response_unreadable": "Response could not be read.",
   "js.server_response_unreadable": "Server response could not be read.",
   "js.update_action_starting": "Action is starting. Waiting for service status.",
+  "js.branch_switch_started": "Branch switch was started. Waiting for status data.",
   "js.update_check_running": "Update check running.",
   "js.update_check_started": "Update check was started.",
   "js.update_finished": "Update finished",
