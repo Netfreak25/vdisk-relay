@@ -43,8 +43,8 @@ WebUI language files under `/usr/local/share/vdisk-relay/i18n/` are installation
 files and are not backed up as configuration.
 
 `META/systemd-enabled.txt` stores the enable/disable state of the vdisk-relay
-units. Restore reapplies those states. If Git credentials are missing in the
-restored state, the update-check timer remains disabled.
+units. Restore reapplies those states. The public repository can be checked for
+updates without stored Git credentials.
 
 ## Restore Dry Run
 

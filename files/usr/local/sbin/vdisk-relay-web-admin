@@ -1177,45 +1177,6 @@ def git_credentials_status():
     }
 
 
-def write_git_credentials(host, username, token):
-    host = host.strip()
-    host = re.sub(r"^https?://", "", host).split("/", 1)[0].strip()
-    username = username.strip()
-    token = token.strip()
-    validate_plain(host, "host")
-    validate_plain(username, "username")
-    validate_plain(token, "token")
-    if not host:
-        raise ValueError("Git host missing")
-    if not username or not token:
-        raise ValueError("Git username and token missing")
-
-    os.makedirs(os.path.dirname(GIT_CREDENTIALS_FILE), mode=0o755, exist_ok=True)
-    content = json.dumps(
-        {"host": host, "username": username, "token": token, "updated_at": time.strftime("%Y-%m-%dT%H:%M:%S%z")},
-        ensure_ascii=False,
-        indent=2,
-        sort_keys=True,
-    ) + "\n"
-    write_atomic(GIT_CREDENTIALS_FILE, content, 0o600)
-
-
-def delete_git_credentials():
-    try:
-        os.unlink(GIT_CREDENTIALS_FILE)
-    except FileNotFoundError:
-        pass
-
-
-def set_update_timer_for_credentials(enabled):
-    if enabled:
-        systemctl_quick(["enable", "--now", "vdisk-relay-update-check.timer"], 20)
-        systemctl_quick(["start", "--no-block", "vdisk-relay-update-check.service"], 8)
-    else:
-        systemctl_quick(["disable", "--now", "vdisk-relay-update-check.timer"], 20)
-        systemctl_quick(["stop", "vdisk-relay-update-check.service", "vdisk-relay-update.service"], 12)
-
-
 def archive_config():
     text = read_file(CONFIG)
     return {
@@ -2790,8 +2751,6 @@ def app_shell_script():
     '/boot-notify/enable': true,
     '/boot-notify/disable': true,
     '/boot-notify/test': true,
-    '/git/save': true,
-    '/git/delete': true,
     '/data/delete': true,
     '/service/start': true,
     '/service/restart': true,
@@ -2811,7 +2770,6 @@ def app_shell_script():
   };
   var buttonIcons = [
     ['Install app', 'download'],
-    ['Save Git credentials', 'check'],
     ['Add profile', 'edit'],
     ['Edit profile', 'edit'],
     ['Edit', 'edit'],
@@ -10577,61 +10535,6 @@ def render_archive_settings_page(query=None, message=""):
     return html_page("Archive", body, active="settings", subtitle="External rsync archive for locally stored data.")
 
 
-def render_git_credentials_panel(query=None):
-    query = query or {}
-    creds = load_git_credentials()
-    status = git_credentials_status()
-    token_required = "" if status["token_present"] else "required"
-    token_hint = "leave empty to keep the existing token" if status["token_present"] else "Personal Access Token"
-    show_form = query.get("edit", ["0"])[0] == "1" or not status["configured"]
-    details_open = " open" if show_form else ""
-
-    return (
-        '<section class="panel" id="git-credentials">'
-        + '<details' + details_open + '>'
-        + '<summary>Git-Credentials <span class="badge '
-        + ('ok' if status["configured"] else "off")
-        + '">'
-        + ("configured" if status["configured"] else "not set")
-        + '</span></summary>'
-        + render_kv_table([
-            ("Gespeichert", "yes" if status["configured"] else "no"),
-            ("Host", status["host"] or "-"),
-            ("Benutzer", status["username"] or "-"),
-            ("Token", "set" if status["token_present"] else "empty"),
-            ("File", status["file"]),
-            ("Askpass", status["askpass"] + (" available" if status["askpass_exists"] else " missing")),
-        ])
-        + '<form method="post" action="/git/save" class="form-grid">'
-        + form_field(
-            "Host",
-            '<input name="host" value="' + esc(creds.get("host") or "") + '" placeholder="host.example.com" required>',
-            "Git server host (without https://, e.g. host.example.com).",
-        )
-        + form_field(
-            "Benutzername",
-            '<input name="username" value="' + esc(creds.get("username", "")) + '" autocomplete="username" required>',
-            "Git-Benutzername oder Organisations-Account.",
-        )
-        + form_field(
-            "Token",
-            '<input type="password" name="token" value="" autocomplete="off" placeholder="'
-            + esc(token_hint)
-            + '" '
-            + token_required
-            + '>',
-            "Personal access token with repository read/write permissions for updates.",
-        )
-        + '<button type="submit">Save Git credentials</button>'
-        + '</form>'
-        + '<form method="post" action="/git/delete" class="inline" onsubmit="return confirm(\'Really delete Git credentials? The update check will be disabled.\');">'
-        + '<button class="danger" type="submit">Delete Git credentials</button>'
-        + '</form>'
-        + '</details>'
-        + '</section>'
-    )
-
-
 def render_boot_notify_settings_page(query=None, message=""):
     query = query or {}
     message = message or query.get("msg", [""])[0]
@@ -12157,13 +12060,10 @@ def render_update_page(query=None):
     status_data = load_status_json()
     check_journal_rc, check_journal = read_unit_journal("vdisk-relay-update-check.service", 80)
     updater_unit_rows = render_unit_control_rows(UPDATER_UNITS, status_data=status_data)
-    git_ready = bool(capability["git_credentials"].get("configured"))
-
     can_start = (
         capability["repo_known"]
         and capability["repo_exists"]
         and capability["runner_exists"]
-        and git_ready
         and not update_active
     )
 
@@ -12172,11 +12072,7 @@ def render_update_page(query=None):
         if can_start
         else '<button class="danger" type="submit" disabled>Start update</button>'
     )
-    check_button = (
-        '<button type="submit">Check update</button>'
-        if git_ready
-        else '<button type="submit" disabled>Check update</button>'
-    )
+    check_button = '<button type="submit">Check update</button>'
 
     monitor_active = "1" if update_active or check_active else "0"
     refresh_script = ""
@@ -12594,7 +12490,6 @@ def render_update_page(query=None):
         + '</h3>'
         + '<pre class="update-log" id="update-check-journal">' + esc(check_journal or ("No journal output. rc=" + str(check_journal_rc))) + '</pre>'
         + '</section>'
-        + render_git_credentials_panel(query=query)
         + '<section class="panel">'
         + '<h2>Update-Capability</h2>'
         + render_kv_table([
@@ -12602,7 +12497,6 @@ def render_update_page(query=None):
             ("Repo available", "yes" if capability["repo_exists"] else "no"),
             ("Update-Runner", "yes" if capability["runner_exists"] else "no"),
             ("Update-Check", "yes" if capability["check_exists"] else "no"),
-            ("Git-Credentials", "yes" if git_ready else "no"),
             ("Update-Service", capability["update_service"]),
             ("Check-Service", capability["check_service"]),
             ("Check-Timer", capability["check_timer"]),
@@ -12623,18 +12517,12 @@ def render_update_page(query=None):
 
 def handle_update_post(handler, path, form):
     if path == "/update/check":
-        if not git_credentials_status()["configured"]:
-            handler.redirect("/update?msg=" + quote("Git credentials missing; update check remains disabled"))
-            return True
         rc, out = start_fixed_unit("vdisk-relay-update-check.service")
         msg = "Update check started" if rc == 0 else "Update check could not be started: " + out[:180]
         handler.redirect("/update?msg=" + quote(msg))
         return True
 
     if path == "/update/start":
-        if not git_credentials_status()["configured"]:
-            handler.redirect("/update?msg=" + quote("Git credentials missing; update remains disabled"))
-            return True
         if systemctl_active("vdisk-relay-update.service") == "active":
             handler.redirect("/update?msg=" + quote("Update already running"))
             return True
@@ -12645,26 +12533,6 @@ def handle_update_post(handler, path, form):
         rc, out = start_fixed_unit("vdisk-relay-update.service")
         msg = "Update started" if rc == 0 else "Update could not be started: " + out[:180]
         handler.redirect("/update?msg=" + quote(msg))
-        return True
-
-    return False
-
-
-def handle_git_post(handler, path, form):
-    if path == "/git/save":
-        existing = load_git_credentials()
-        host = form.get("host", [""])[0].strip() or existing.get("host", "")
-        username = form.get("username", [""])[0].strip() or existing.get("username", "")
-        token = form.get("token", [""])[0].strip() or existing.get("token", "")
-        write_git_credentials(host, username, token)
-        set_update_timer_for_credentials(True)
-        handler.redirect("/update?msg=" + quote("Git credentials saved; update check enabled"))
-        return True
-
-    if path == "/git/delete":
-        delete_git_credentials()
-        set_update_timer_for_credentials(False)
-        handler.redirect("/update?msg=" + quote("Git credentials deleted; update check disabled"))
         return True
 
     return False
@@ -14662,19 +14530,6 @@ class Handler(BaseHTTPRequestHandler):
             self.send_html(render_archive_settings_page(query=query))
             return
 
-        if parsed.path == "/git":
-            msg = query.get("msg", [""])[0]
-            redirect_params = {}
-            if msg:
-                redirect_params["msg"] = msg
-            if query.get("edit", [""])[0] == "1":
-                redirect_params["edit"] = "1"
-            redirect_url = "/update"
-            if redirect_params:
-                redirect_url += "?" + urlencode(redirect_params)
-            self.redirect(redirect_url)
-            return
-
         if parsed.path == "/boot-notify":
             self.send_html(render_boot_notify_settings_page(query=query))
             return
@@ -14731,9 +14586,6 @@ class Handler(BaseHTTPRequestHandler):
                 return
 
             if handle_archive_post(self, path, form):
-                return
-
-            if handle_git_post(self, path, form):
                 return
 
             if handle_boot_notify_post(self, path, form):
@@ -15011,8 +14863,6 @@ class Handler(BaseHTTPRequestHandler):
                 target = "/wifi"
             elif path.startswith("/archive/"):
                 target = "/archive"
-            elif path.startswith("/git/"):
-                target = "/update"
             elif path.startswith("/boot-notify/"):
                 target = "/boot-notify"
             elif path.startswith("/maintenance-notify/"):

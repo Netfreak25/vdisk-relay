@@ -130,8 +130,7 @@ Gate and live-mode details:
   Live mode enables and starts units for USB gadget, file watch, retry sync,
   archive, health watchdog, status cache, web cache, debug cache, preview cache,
   and WebUI. Boot notify is enabled for the next boot, but not run immediately.
-  The update-check timer is enabled only when Git credentials are
-  stored in the WebUI.
+  The update-check timer is enabled when the WebUI updater is installed.
   If required configuration is missing, runtime services are paused and only
   WebUI/wizard remains active.
 
@@ -654,13 +653,7 @@ refresh_runtime_after_update() {
     start_cache_if_available vdisk-relay-web-status-cache.service
     start_cache_if_available vdisk-relay-debug-cache.service
     start_cache_if_available vdisk-relay-preview-cache.service
-    if [ -s /var/lib/vdisk-relay/git-credentials.json ]; then
-      start_cache_if_available vdisk-relay-update-check.service
-    else
-      systemctl_fast disable vdisk-relay-update-check.timer >/dev/null 2>&1 || true
-      systemctl_fast --no-block stop vdisk-relay-update-check.service vdisk-relay-update.service >/dev/null 2>&1 || true
-      warn "Git credentials missing; update-check timer remains disabled"
-    fi
+    start_cache_if_available vdisk-relay-update-check.service
   fi
 }
 
@@ -839,19 +832,11 @@ enable_live_services() {
     systemctl_enable_now_fast vdisk-relay-debug-cache.timer
     systemctl_enable_now_fast vdisk-relay-preview-cache.timer
     enable_unit_if_gate vdisk-relay-network-guardian.timer /etc/vdisk-relay.allow-network-guardian --now
-    if [ -s /var/lib/vdisk-relay/git-credentials.json ]; then
-      systemctl_enable_now_fast vdisk-relay-update-check.timer
-    else
-      systemctl_fast disable vdisk-relay-update-check.timer >/dev/null 2>&1 || true
-      systemctl_fast --no-block stop vdisk-relay-update-check.service vdisk-relay-update.service >/dev/null 2>&1 || true
-      warn "Git credentials missing; vdisk-relay-update-check.timer not enabled"
-    fi
+    systemctl_enable_now_fast vdisk-relay-update-check.timer
     start_cache_if_available vdisk-relay-debug-cache.service
     start_cache_if_available vdisk-relay-web-status-cache.service
     start_cache_if_available vdisk-relay-preview-cache.service
-    if [ -s /var/lib/vdisk-relay/git-credentials.json ]; then
-      start_cache_if_available vdisk-relay-update-check.service
-    fi
+    start_cache_if_available vdisk-relay-update-check.service
     systemctl_enable_now_fast vdisk-relay-web.service
   fi
 

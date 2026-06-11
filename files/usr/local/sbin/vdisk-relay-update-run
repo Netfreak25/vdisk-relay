@@ -56,30 +56,6 @@ def git_credentials_status():
     }
 
 
-def disable_update_units_without_credentials(log_func=None):
-    systemctl = shutil.which("systemctl") or "/bin/systemctl"
-    try:
-        subprocess.run(
-            [systemctl, "disable", "--now", "vdisk-relay-update-check.timer"],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            timeout=15,
-            check=False,
-        )
-        subprocess.run(
-            [systemctl, "stop", "vdisk-relay-update-check.service"],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            timeout=15,
-            check=False,
-        )
-        if log_func:
-            log_func("update units disabled because git credentials are missing")
-    except Exception as exc:
-        if log_func:
-            log_func("update unit disable failed: " + str(exc))
-
-
 class UpdateJob:
     def __init__(self):
         os.makedirs(UPDATE_DIR, mode=0o755, exist_ok=True)
@@ -236,21 +212,6 @@ class UpdateJob:
             raise RuntimeError(f"Install script missing: {install_script}")
 
         self.old_commit = self.git_value(repo, ["rev-parse", "HEAD"])
-        credentials = git_credentials_status()
-        if not credentials.get("configured"):
-            self.exit_code = 0
-            self.diagnostics = "HTTPS updates require Git credentials. Store them in the WebUI under Settings > Git."
-            disable_update_units_without_credentials(self.log)
-            self.write_status(
-                "blocked",
-                "configuration",
-                "Git credentials missing",
-                running=False,
-                exit_code=0,
-                finished_at=now_iso(),
-            )
-            return 0
-
         rc = self.run_command("fetching", "Git fetch running", self.git_command(repo, ["fetch", "--quiet", "--prune"]), timeout=120, env=self.git_env())
         if rc != 0:
             self.exit_code = rc

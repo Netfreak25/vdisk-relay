@@ -3,7 +3,6 @@ import datetime
 import json
 import os
 import re
-import shutil
 import subprocess
 import sys
 import tempfile
@@ -111,28 +110,6 @@ def mask_remote_url(url):
     return re.sub(r"(https?://)([^/@:]+)(:[^/@]*)?@", r"\1***@", url)
 
 
-def disable_update_units_without_credentials():
-    systemctl = shutil.which("systemctl") or "/bin/systemctl"
-    try:
-        subprocess.run(
-            [systemctl, "disable", "--now", "vdisk-relay-update-check.timer"],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            timeout=15,
-            check=False,
-        )
-        subprocess.run(
-            [systemctl, "stop", "vdisk-relay-update.service", "vdisk-relay-update-check.service"],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            timeout=15,
-            check=False,
-        )
-        log("update units disabled because git credentials are missing")
-    except Exception as exc:
-        log("update unit disable failed: " + str(exc))
-
-
 def git_command(repo, args):
     return ["git", "-c", f"safe.directory={repo}", "-C", repo] + list(args)
 
@@ -235,22 +212,6 @@ def main_inner():
     remote_url = git_value(repo, ["config", "--get", "remote.origin.url"])
 
     credentials = git_credentials_status()
-    if remote_url.startswith("http") and not credentials.get("configured"):
-        disable_update_units_without_credentials()
-        write_json(STATUS_FILE, status_error(
-            "Git credentials missing",
-            repo=repo,
-            diagnostics="HTTPS remote requires credentials. Store them in the WebUI under Settings > Git.",
-            extra={
-                "branch": branch,
-                "current_commit": local_commit,
-                "current_short": local_short,
-                "remote_url": mask_remote_url(remote_url),
-                "git_credentials": credentials,
-            },
-        ))
-        return 0
-
     rc, fetch_out = run_git(repo, ["fetch", "--quiet", "--prune"], 90)
     if rc != 0:
         diag = (
