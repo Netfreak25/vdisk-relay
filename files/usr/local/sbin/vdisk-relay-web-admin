@@ -9061,6 +9061,7 @@ def settings_tabs(active):
         ("timeline", "/settings/timeline", t("settings.tab_timeline")),
         ("performance", "/settings/performance", t("settings.tab_performance")),
         ("previews", "/settings/previews", t("settings.tab_previews")),
+        ("sources", "/sources", t("phrase.sources")),
         ("telegram", "/settings/telegram", t("settings.tab_telegram")),
         ("system", "/settings/system", t("settings.tab_system")),
         ("actions", "/settings/actions", t("settings.tab_actions")),
